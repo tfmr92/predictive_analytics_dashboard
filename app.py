@@ -1,3 +1,8 @@
+"""
+Home — Azul E2 Predictive Maintenance Dashboard
+Summary KPIs + mini trend charts for all monitored systems.
+"""
+
 import pandas as pd
 import plotly.express as px
 import streamlit as st
@@ -5,41 +10,36 @@ import streamlit as st
 from utils.drive_loader import load
 
 st.set_page_config(
-    page_title="Azul E2 — Manutenção Preditiva",
+    page_title="Azul E2 — Predictive Maintenance",
     page_icon="✈️",
     layout="wide",
 )
 
-st.title("✈️ Azul E2 — Manutenção Preditiva")
-st.caption("Atualizado automaticamente a cada execução do Dagster · dados com até 1h de defasagem")
+st.title("✈️ Azul E2 — Predictive Maintenance")
+st.caption("Refreshed automatically with every Dagster run · data lag ≤ 1 h")
 
-# ── Carregar dados ────────────────────────────────────────────────────────────
-df_sav_lh  = load("e2_sav_lh_report.parquet")
-df_sav_rh  = load("e2_sav_rh_report.parquet")
-df_wnb     = load("e2_wnb_report.parquet")
-df_oxy     = load("e2_oxy_report.parquet")
-df_fuel    = load("e2_fuel_report.parquet")
+# ── Load data ──────────────────────────────────────────────────────────────────
+df_sav_lh = load("e2_sav_lh_report.parquet")
+df_sav_rh = load("e2_sav_rh_report.parquet")
+df_wnb    = load("e2_wnb_report.parquet")
+df_oxy    = load("e2_oxy_report.parquet")
+df_fuel   = load("e2_fuel_report.parquet")
+
+for df in (df_sav_lh, df_sav_rh, df_wnb, df_oxy, df_fuel):
+    if "date" in df.columns:
+        df["date"] = pd.to_datetime(df["date"], errors="coerce")
 
 
-def _risk_count(df: pd.DataFrame, pred_col: str) -> int:
-    if df.empty or pred_col not in df.columns:
+def _alert_aircraft(df: pd.DataFrame, pred_col: str, ac_col: str = "ac_sn") -> int:
+    """Latest flight for each aircraft — how many are in alert."""
+    if df.empty or pred_col not in df.columns or ac_col not in df.columns:
         return 0
-    recent = df.sort_values("date").groupby("ac_sn").tail(30)
-    return int((recent[pred_col] == 1).sum())
+    return int(df.sort_values("date").groupby(ac_col).last()[pred_col].eq(1).sum())
 
 
-def _alert_aircraft(df: pd.DataFrame) -> int:
-    if df.empty or "alert" not in df.columns:
-        return 0
-    latest = df.sort_values("date").groupby("aircraftSerNum-1").last()
-    return int(latest["alert"].sum())
-
-
-# ── KPIs resumo ───────────────────────────────────────────────────────────────
-col1, col2, col3, col4 = st.columns(4)
-
-sav_lh_risk = _risk_count(df_sav_lh, "pre_lh_sav_failure_prediction")
-sav_rh_risk = _risk_count(df_sav_rh, "pre_rh_sav_failure_prediction")
+# ── Fleet KPIs ────────────────────────────────────────────────────────────────
+sav_lh_alert = _alert_aircraft(df_sav_lh, "pre_lh_sav_failure_prediction")
+sav_rh_alert = _alert_aircraft(df_sav_rh, "pre_rh_sav_failure_prediction")
 
 wnb_hard = 0
 if not df_wnb.empty:
@@ -47,24 +47,33 @@ if not df_wnb.empty:
         if col in df_wnb.columns:
             wnb_hard += int((df_wnb[col] > 1.4).sum())
 
-oxy_alerts = _alert_aircraft(df_oxy)
+oxy_ac_col = next((c for c in ("aircraftSerNum-1", "ac_sn") if c in df_oxy.columns), None)
+oxy_below_psi = 0
+if oxy_ac_col and "psi" in df_oxy.columns:
+    latest_oxy = df_oxy.dropna(subset=["psi"]).sort_values("date").groupby(oxy_ac_col).last()
+    oxy_below_psi = int((latest_oxy["psi"] < 1800).sum())
+elif not df_oxy.empty and "alert" in df_oxy.columns and oxy_ac_col:
+    oxy_below_psi = int(df_oxy.sort_values("date").groupby(oxy_ac_col).last()["alert"].sum())
 
-col1.metric("🔴 Alertas SAV (LH)", sav_lh_risk, help="Voos com predição de pré-falha no Starter esquerdo")
-col2.metric("🔴 Alertas SAV (RH)", sav_rh_risk, help="Voos com predição de pré-falha no Starter direito")
-col3.metric("⚠️ Pousos duros (W&B)", wnb_hard, help="Pousos com aceleração acima de 1,4 g")
-col4.metric("💨 Alertas Oxigênio", oxy_alerts, help="Aeronaves com alerta de queda de pressão")
+c1, c2, c3, c4 = st.columns(4)
+c1.metric("🔴 SAV alerts — LH", sav_lh_alert,
+          help="Aircraft with predicted pre-failure on left starter valve (latest flight)")
+c2.metric("🔴 SAV alerts — RH", sav_rh_alert,
+          help="Aircraft with predicted pre-failure on right starter valve (latest flight)")
+c3.metric("⚠️ Hard landings (W&B)", wnb_hard,
+          help="Total landings above 1.4 g in the loaded dataset")
+c4.metric("💨 Oxy below threshold", oxy_below_psi,
+          help="Aircraft with latest pressure reading < 1800 PSI")
 
 st.divider()
 
-# ── Mini-gráficos de tendência ─────────────────────────────────────────────────
-st.subheader("Tendência geral")
-
+# ── Mini trend charts ──────────────────────────────────────────────────────────
+st.subheader("Fleet Trends")
 left, right = st.columns(2)
 
-# SAV: % de voos com alerta por semana
+# SAV LH — weekly alert rate
 with left:
-    if not df_sav_lh.empty and "date" in df_sav_lh.columns:
-        df_sav_lh["date"] = pd.to_datetime(df_sav_lh["date"], errors="coerce")
+    if not df_sav_lh.empty and "date" in df_sav_lh.columns and "pre_lh_sav_failure_prediction" in df_sav_lh.columns:
         weekly = (
             df_sav_lh.dropna(subset=["date"])
             .set_index("date")
@@ -72,27 +81,51 @@ with left:
             .mean()
             .reset_index()
         )
-        weekly.columns = ["Semana", "% Alertas LH"]
+        weekly.columns = ["Week", "Alert Rate"]
         fig = px.area(
-            weekly, x="Semana", y="% Alertas LH",
-            title="SAV LH — % de voos com alerta por semana",
+            weekly, x="Week", y="Alert Rate",
+            title="SAV LH — weekly % flights in alert",
             color_discrete_sequence=["#ef4444"],
         )
-        fig.update_layout(yaxis_tickformat=".0%", height=260)
+        fig.update_layout(
+            yaxis_tickformat=".0%",
+            height=260,
+            xaxis=dict(tickformat="%d-%b-%y"),
+        )
         st.plotly_chart(fig, use_container_width=True)
+    else:
+        st.info("SAV LH data not available.")
 
-# Oxy: delta de pressão ao longo do tempo
+# Oxy — absolute PSI trend
 with right:
-    if not df_oxy.empty and "date" in df_oxy.columns and "delta_press" in df_oxy.columns:
-        df_oxy["date"] = pd.to_datetime(df_oxy["date"], errors="coerce")
+    psi_col = "psi" if "psi" in df_oxy.columns else None
+    if not df_oxy.empty and "date" in df_oxy.columns and psi_col and oxy_ac_col:
+        fig2 = px.line(
+            df_oxy.dropna(subset=["date", psi_col]).sort_values("date"),
+            x="date", y=psi_col,
+            color=oxy_ac_col,
+            title="Crew Oxygen — pressure PSI per aircraft",
+            labels={psi_col: "PSI", "date": "", oxy_ac_col: "MSN"},
+        )
+        fig2.add_hline(y=1800, line_dash="dash", line_color="red",
+                       annotation_text="1800 PSI min", annotation_position="top right")
+        fig2.update_layout(
+            height=260,
+            xaxis=dict(tickformat="%d-%b-%y"),
+            showlegend=False,
+        )
+        st.plotly_chart(fig2, use_container_width=True)
+    elif not df_oxy.empty and "date" in df_oxy.columns and "delta_press" in df_oxy.columns:
         fig2 = px.line(
             df_oxy.dropna(subset=["date"]).sort_values("date"),
             x="date", y="delta_press",
-            color="aircraftSerNum-1" if "aircraftSerNum-1" in df_oxy.columns else None,
-            title="Oxigênio — perda de pressão por voo",
-            labels={"delta_press": "Queda de pressão (PSI)", "date": ""},
+            color=oxy_ac_col if oxy_ac_col else None,
+            title="Crew Oxygen — daily pressure drop",
+            labels={"delta_press": "Drop (PSI)", "date": ""},
         )
-        fig2.update_layout(height=260)
+        fig2.update_layout(height=260, xaxis=dict(tickformat="%d-%b-%y"), showlegend=False)
         st.plotly_chart(fig2, use_container_width=True)
+    else:
+        st.info("Oxygen data not available.")
 
-st.info("Use o menu lateral para acessar os dashboards detalhados de cada sistema.")
+st.info("Use the sidebar to navigate to detailed dashboards for each system.")

@@ -1,170 +1,262 @@
 """
-Página Wheels & Brakes — Rodas e Freios
-
-Monitora a dureza dos pousos e o desgaste das rodas.
-Pousos duros aceleram o desgaste de pneus, freios e estrutura.
-O modelo prevê remoção de cada posição de roda antes da falha.
+Wheels & Brakes — landing gear wheel health and removal forecasting.
+Focus: accelerated degradation detection + remaining-cycle estimates.
 """
 
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
+import numpy as np
 import streamlit as st
 
 from utils.drive_loader import load
 
-st.set_page_config(page_title="Rodas & Freios", layout="wide")
+st.set_page_config(page_title="Wheels & Brakes", layout="wide")
 
-st.title("🛞 Rodas e Freios (Wheels & Brakes)")
+st.title("🛞 Wheels & Brakes")
 st.markdown(
-    "Monitoramento da **dureza dos pousos** e do desgaste das rodas. "
-    "Um pouso duro (acima de **1,4 g**) desgasta freios, pneus e a estrutura da aeronave. "
-    "O modelo identifica quais rodas estão próximas da necessidade de remoção."
+    "Identifies which wheels are in **accelerated degradation**, which should be scheduled for **removal**, "
+    "and how many cycles remain before they reach the removal threshold."
 )
 
-# ── Dados ─────────────────────────────────────────────────────────────────────
+# ── Data ──────────────────────────────────────────────────────────────────────
 df = load("e2_wnb_report.parquet")
 
 if df.empty:
-    st.error("Dados ainda não disponíveis. Execute o job `save_wheel_brake_report` no Dagster.")
+    st.error("No data yet. Run the `save_wheel_brake_report` job in Dagster.")
     st.stop()
 
 if "date" in df.columns:
     df["date"] = pd.to_datetime(df["date"], errors="coerce")
-
 if "ac_sn" in df.columns:
     df["ac_sn"] = df["ac_sn"].astype(str)
 
-# Filtros
-all_ac = sorted(df["ac_sn"].dropna().unique().tolist()) if "ac_sn" in df.columns else []
-selected = st.multiselect("Filtrar aeronave(s)", options=all_ac, default=all_ac[:10] if len(all_ac) > 10 else all_ac)
-if selected and "ac_sn" in df.columns:
-    df = df[df["ac_sn"].isin(selected)]
+# ── Sidebar controls ──────────────────────────────────────────────────────────
+with st.sidebar:
+    st.header("Filters")
+    days_back = st.slider("Days of history", 30, 365, 120)
+    all_ac = sorted(df["ac_sn"].dropna().unique().tolist()) if "ac_sn" in df.columns else []
+    selected_ac = st.multiselect("Aircraft (MSN)", options=all_ac, default=all_ac)
+    WHEEL_LIFE = st.number_input(
+        "Assumed wheel life (cycles)", min_value=500, max_value=5000, value=1200, step=100,
+        help="Typical E2 main-gear wheel removal threshold. Adjust per your Maintenance Manual.",
+    )
 
-_HARD_LIMIT = 1.4   # g
-_SEVERE_LIMIT = 2.0  # g
+cutoff = pd.Timestamp.now() - pd.Timedelta(days=days_back)
+if selected_ac and "ac_sn" in df.columns:
+    df = df[df["ac_sn"].isin(selected_ac)]
+if "date" in df.columns:
+    df = df[df["date"] >= cutoff].dropna(subset=["date"]).sort_values("date")
+
+# ── Position mapping ──────────────────────────────────────────────────────────
+_POSITIONS = {
+    "mlg1":   ("MLG 1 — LH Front",  "prediction_mlg1",   "time_since_installation_1"),
+    "mlg2":   ("MLG 2 — LH Rear",   "prediction_mlg2",   "time_since_installation_2"),
+    "mlg3":   ("MLG 3 — RH Front",  "prediction_mlg3",   "time_since_installation_3"),
+    "mlg4":   ("MLG 4 — RH Rear",   "prediction_mlg4",   "time_since_installation_4"),
+    "nlg_lh": ("NLG — Left",        "prediction_nlg_lh", "time_since_installation_5"),
+    "nlg_rh": ("NLG — Right",       "prediction_nlg_rh", "time_since_installation_6"),
+}
+
+_HARD_G = 1.4
+_SEVERE_G = 2.0
+
+# ── KPIs ──────────────────────────────────────────────────────────────────────
+pred_cols = [v[1] for v in _POSITIONS.values() if v[1] in df.columns]
+total_alerts = int(df[pred_cols].eq(1).any(axis=1).sum()) if pred_cols else 0
+hard_lh = int((df["NormAccel_lh"] > _HARD_G).sum()) if "NormAccel_lh" in df.columns else 0
+hard_rh = int((df["NormAccel_rh"] > _HARD_G).sum()) if "NormAccel_rh" in df.columns else 0
+
+# Aircraft with any wheel in alert
+ac_in_alert = set()
+if "ac_sn" in df.columns and pred_cols:
+    mask = df[pred_cols].eq(1).any(axis=1)
+    ac_in_alert = set(df.loc[mask, "ac_sn"].dropna().unique())
+
+c1, c2, c3, c4 = st.columns(4)
+c1.metric("✈️ Aircraft in alert", len(ac_in_alert))
+c2.metric("🔴 Flights with removal alert", total_alerts)
+c3.metric("⚠️ Hard landings — LH (> 1.4 g)", hard_lh)
+c4.metric("⚠️ Hard landings — RH (> 1.4 g)", hard_rh)
 
 st.divider()
 
-# ── KPIs ──────────────────────────────────────────────────────────────────────
-hard_lh = int((df["NormAccel_lh"] > _HARD_LIMIT).sum()) if "NormAccel_lh" in df.columns else 0
-hard_rh = int((df["NormAccel_rh"] > _HARD_LIMIT).sum()) if "NormAccel_rh" in df.columns else 0
-bounce_max = int(df[["bouncing_count_lh", "bouncing_count_rh"]].max().max()) if all(
-    c in df.columns for c in ("bouncing_count_lh", "bouncing_count_rh")
-) else 0
+# ── Section 1: Removal Priority Table ─────────────────────────────────────────
+st.subheader("1. Removal Priority — Wheels to Act On")
+st.caption(
+    "Shows the latest alert rate and cycles-in-service for each wheel position. "
+    f"Remaining cycles = assumed life ({WHEEL_LIFE} cycles) minus time-since-installation."
+)
 
-pred_cols = [c for c in df.columns if c.startswith("prediction_")]
-total_alerts = int(df[pred_cols].eq(1).any(axis=1).sum()) if pred_cols else 0
-
-c1, c2, c3, c4 = st.columns(4)
-c1.metric("Pousos duros (LH > 1,4 g)", hard_lh)
-c2.metric("Pousos duros (RH > 1,4 g)", hard_rh)
-c3.metric("Máx. de ricochetes em um pouso", bounce_max)
-c4.metric("🔴 Voos com alerta de remoção", total_alerts)
-
-# ── Gráfico 1: dureza dos pousos ──────────────────────────────────────────────
-st.subheader("Dureza dos pousos por voo")
-st.caption(f"Linha laranja = {_HARD_LIMIT} g (limite atenção)  |  Linha vermelha = {_SEVERE_LIMIT} g (limite crítico)")
-
-tab_lh, tab_rh = st.tabs(["Trem Principal Esquerdo (LH)", "Trem Principal Direito (RH)"])
-
-for tab, acol, label in [
-    (tab_lh, "NormAccel_lh", "LH"),
-    (tab_rh, "NormAccel_rh", "RH"),
-]:
-    with tab:
-        if acol not in df.columns:
-            st.info("Coluna não disponível.")
+rows = []
+if "ac_sn" in df.columns:
+    for pos_key, (pos_label, pred_col, tsi_col) in _POSITIONS.items():
+        if pred_col not in df.columns:
             continue
-        df_plot = df.dropna(subset=["date", acol]).copy()
-        df_plot["Classificação"] = pd.cut(
-            df_plot[acol],
-            bins=[-999, _HARD_LIMIT, _SEVERE_LIMIT, 999],
-            labels=["Normal", "Atenção", "Crítico"],
+
+        # Latest prediction per aircraft
+        latest = (
+            df.dropna(subset=["ac_sn"])
+            .sort_values("date")
+            .groupby("ac_sn")
+            .last()
         )
-        color_map = {"Normal": "#22c55e", "Atenção": "#f59e0b", "Crítico": "#ef4444"}
-        fig = px.scatter(
-            df_plot.sort_values("date"),
-            x="date", y=acol,
-            color="Classificação",
-            color_discrete_map=color_map,
-            hover_data={"ac_sn": True} if "ac_sn" in df_plot.columns else {},
-            labels={acol: "Aceleração no pouso (g)", "date": ""},
-            title=f"Força no pouso — Trem {label}",
-        )
-        fig.add_hline(y=_HARD_LIMIT, line_dash="dot", line_color="orange",
-                      annotation_text="atenção", annotation_position="top right")
-        fig.add_hline(y=_SEVERE_LIMIT, line_dash="dot", line_color="red",
-                      annotation_text="crítico", annotation_position="top right")
-        fig.update_layout(height=360)
-        st.plotly_chart(fig, use_container_width=True)
+        for ac in latest.index:
+            row = latest.loc[ac]
+            alert = int(row[pred_col]) if pred_col in latest.columns else 0
+            tsi = float(row[tsi_col]) if tsi_col in latest.columns and pd.notna(row.get(tsi_col)) else None
+            remaining = max(0, WHEEL_LIFE - tsi) if tsi is not None else None
+            alert_rate = float(
+                df[df["ac_sn"] == ac][pred_col].eq(1).mean() * 100
+            ) if pred_col in df.columns else 0
 
-# ── Gráfico 2: ricochetes por aeronave ────────────────────────────────────────
-st.subheader("Ricochetes no pouso por aeronave")
-st.caption("Cada ricochete = a aeronave voltou a subir após tocar a pista. Indica pouso instável.")
+            rows.append({
+                "MSN": ac,
+                "Position": pos_label,
+                "Current Alert": "🔴 YES" if alert else "✅ No",
+                "Alert Rate (%)": round(alert_rate, 1),
+                "Cycles In Service": round(tsi) if tsi is not None else "—",
+                "Est. Remaining Cycles": round(remaining) if remaining is not None else "—",
+            })
 
-if all(c in df.columns for c in ("bouncing_count_lh", "bouncing_count_rh", "ac_sn")):
-    bounce_agg = (
-        df.groupby("ac_sn")[["bouncing_count_lh", "bouncing_count_rh"]]
-        .mean()
-        .round(1)
-        .reset_index()
-        .sort_values("bouncing_count_lh", ascending=False)
-    )
-    fig_bounce = go.Figure()
-    fig_bounce.add_bar(x=bounce_agg["ac_sn"], y=bounce_agg["bouncing_count_lh"],
-                       name="LH", marker_color="#3b82f6")
-    fig_bounce.add_bar(x=bounce_agg["ac_sn"], y=bounce_agg["bouncing_count_rh"],
-                       name="RH", marker_color="#8b5cf6")
-    fig_bounce.update_layout(
-        barmode="group",
-        title="Média de ricochetes por aeronave",
-        xaxis_title="Aeronave", yaxis_title="Ricochetes (média)",
-        height=340,
-    )
-    st.plotly_chart(fig_bounce, use_container_width=True)
+if rows:
+    priority_df = pd.DataFrame(rows)
+    # Sort: alert first, then highest alert rate
+    priority_df["_sort"] = priority_df["Current Alert"].apply(lambda x: 0 if "YES" in x else 1)
+    priority_df = priority_df.sort_values(["_sort", "Alert Rate (%)"], ascending=[True, False]).drop(columns="_sort")
+    st.dataframe(priority_df, use_container_width=True, hide_index=True)
+else:
+    st.info("Prediction columns not found. Run the Dagster pipeline to generate predictions.")
 
-# ── Gráfico 3: previsão de remoção por posição ────────────────────────────────
-st.subheader("Previsão de remoção por posição de roda")
-st.caption("Vermelho = modelo detectou sinais de desgaste acelerado nesta posição.")
+st.divider()
 
-_POS_LABELS = {
-    "prediction_mlg1": "MLG 1\n(LH frente)",
-    "prediction_mlg2": "MLG 2\n(LH trás)",
-    "prediction_mlg3": "MLG 3\n(RH frente)",
-    "prediction_mlg4": "MLG 4\n(RH trás)",
-    "prediction_nlg_lh": "NLG LH\n(nariz esq.)",
-    "prediction_nlg_rh": "NLG RH\n(nariz dir.)",
-}
+# ── Section 2: Degradation Heatmap ────────────────────────────────────────────
+st.subheader("2. Degradation Heatmap — Alert Rate per Aircraft × Wheel Position")
+st.caption("Red = high proportion of flights with removal alert at that position.")
 
-available_preds = [c for c in _POS_LABELS if c in df.columns]
+available_preds = [v[1] for v in _POSITIONS.values() if v[1] in df.columns]
+pos_labels = {v[1]: v[0] for v in _POSITIONS.values()}
+
 if available_preds and "ac_sn" in df.columns:
     heatmap_data = (
         df.groupby("ac_sn")[available_preds]
-        .apply(lambda g: (g == 1).mean())
-        .rename(columns=_POS_LABELS)
+        .apply(lambda g: (g == 1).mean() * 100)
+        .rename(columns=pos_labels)
         .reset_index()
     )
-    heatmap_melted = heatmap_data.melt(id_vars="ac_sn", var_name="Posição", value_name="% alertas")
+    melted = heatmap_data.melt(id_vars="ac_sn", var_name="Position", value_name="Alert Rate (%)")
+
     fig_heat = px.density_heatmap(
-        heatmap_melted, x="Posição", y="ac_sn", z="% alertas",
+        melted, x="Position", y="ac_sn", z="Alert Rate (%)",
         color_continuous_scale=["#dcfce7", "#fef9c3", "#fca5a5", "#ef4444"],
-        labels={"ac_sn": "Aeronave", "% alertas": "% voos em alerta"},
-        title="Mapa de calor — risco de remoção por aeronave e posição",
+        labels={"ac_sn": "MSN"},
+        title="Alert Rate (%) — by Aircraft and Wheel Position",
     )
     fig_heat.update_layout(height=max(300, len(heatmap_data) * 30))
     st.plotly_chart(fig_heat, use_container_width=True)
 
-# ── Top 10 pousos mais duros ────────────────────────────────────────────────
-st.subheader("Top 10 pousos mais duros do período")
-if "NormAccel_lh" in df.columns and "date" in df.columns:
-    top = (
-        df.nlargest(10, "NormAccel_lh")[["date", "ac_sn", "NormAccel_lh", "NormAccel_rh",
-                                          "bouncing_count_lh", "bouncing_count_rh"]]
-        .rename(columns={
-            "date": "Data", "ac_sn": "Aeronave",
-            "NormAccel_lh": "Aceleração LH (g)", "NormAccel_rh": "Aceleração RH (g)",
-            "bouncing_count_lh": "Ricochetes LH", "bouncing_count_rh": "Ricochetes RH",
-        })
-    )
-    st.dataframe(top, use_container_width=True, hide_index=True)
+st.divider()
+
+# ── Section 3: Time Since Installation Trend ──────────────────────────────────
+st.subheader("3. Cycles In Service — Progress Toward Removal Threshold")
+st.caption(
+    f"Each line is one aircraft. The red dashed line marks the assumed {WHEEL_LIFE}-cycle removal threshold. "
+    "Aircraft near or above the line should be scheduled for wheel change."
+)
+
+tsi_cols_available = [(v[0], v[2]) for v in _POSITIONS.values() if v[2] in df.columns]
+if tsi_cols_available and "ac_sn" in df.columns:
+    tab_names = [label for label, _ in tsi_cols_available]
+    tsi_tabs = st.tabs(tab_names)
+    for tab_w, (pos_label, tsi_col) in zip(tsi_tabs, tsi_cols_available):
+        with tab_w:
+            df_tsi = df.dropna(subset=["date", tsi_col, "ac_sn"]).copy()
+            if df_tsi.empty:
+                st.info("No data for this position.")
+                continue
+
+            fig_tsi = px.line(
+                df_tsi, x="date", y=tsi_col,
+                color="ac_sn",
+                labels={tsi_col: "Cycles in Service", "date": "", "ac_sn": "MSN"},
+                title=f"{pos_label} — Cycles in Service over Time",
+            )
+            fig_tsi.add_hline(
+                y=WHEEL_LIFE, line_dash="dash", line_color="red",
+                annotation_text=f"Removal threshold ({WHEEL_LIFE} cycles)",
+                annotation_position="top right",
+            )
+            fig_tsi.update_layout(
+                height=320,
+                xaxis=dict(tickformat="%d-%b-%y"),
+                legend_title_text="MSN",
+            )
+            st.plotly_chart(fig_tsi, use_container_width=True)
+
+st.divider()
+
+# ── Section 4: Landing Hardness ────────────────────────────────────────────────
+st.subheader("4. Landing Hardness — Accelerated Wear Events")
+st.caption(
+    f"Hard landings (> {_HARD_G} g) accelerate wear on tyres, brakes, and structure. "
+    f"Severe landings (> {_SEVERE_G} g) require mandatory inspection."
+)
+
+tab_lh_land, tab_rh_land = st.tabs(["Left Main Gear (LH)", "Right Main Gear (RH)"])
+
+for tab_l, acol, label in [
+    (tab_lh_land, "NormAccel_lh", "LH"),
+    (tab_rh_land, "NormAccel_rh", "RH"),
+]:
+    with tab_l:
+        if acol not in df.columns:
+            st.info("Column not available.")
+            continue
+
+        df_land = df.dropna(subset=["date", acol]).copy()
+        df_land["Severity"] = pd.cut(
+            df_land[acol],
+            bins=[-999, _HARD_G, _SEVERE_G, 999],
+            labels=["Normal", "Hard", "Severe"],
+        )
+        color_map = {"Normal": "#22c55e", "Hard": "#f59e0b", "Severe": "#ef4444"}
+
+        fig_land = px.scatter(
+            df_land, x="date", y=acol,
+            color="Severity",
+            color_discrete_map=color_map,
+            symbol="ac_sn",
+            hover_data={"ac_sn": True},
+            labels={acol: "Peak G-force (g)", "date": "", "ac_sn": "MSN"},
+            title=f"Landing G-force — {label}",
+        )
+        fig_land.add_hline(y=_HARD_G, line_dash="dot", line_color="orange",
+                           annotation_text="Hard (1.4 g)", annotation_position="top right")
+        fig_land.add_hline(y=_SEVERE_G, line_dash="dot", line_color="red",
+                           annotation_text="Severe (2.0 g)", annotation_position="top right")
+        fig_land.update_layout(
+            height=360,
+            xaxis=dict(tickformat="%d-%b-%y"),
+            legend_title_text="Severity",
+        )
+        st.plotly_chart(fig_land, use_container_width=True)
+
+        # Per-MSN hard landing count bar
+        if "ac_sn" in df_land.columns:
+            hard_counts = (
+                df_land[df_land[acol] > _HARD_G]
+                .groupby("ac_sn")
+                .size()
+                .reset_index(name="Hard Landings")
+                .sort_values("Hard Landings", ascending=False)
+            )
+            if not hard_counts.empty:
+                fig_bar = px.bar(
+                    hard_counts, x="ac_sn", y="Hard Landings",
+                    color="Hard Landings",
+                    color_continuous_scale=["#fef9c3", "#ef4444"],
+                    labels={"ac_sn": "MSN"},
+                    title=f"Hard landings per aircraft — {label}",
+                )
+                fig_bar.update_layout(height=280, coloraxis_showscale=False)
+                st.plotly_chart(fig_bar, use_container_width=True)

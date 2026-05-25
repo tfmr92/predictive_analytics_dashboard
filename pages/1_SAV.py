@@ -1,9 +1,6 @@
 """
-Página SAV — Air Turbine Starter (Motor Starter)
-
-O starter arranca o motor no início de cada voo. Quando ele começa a se
-desgastar, o motor demora mais para ligar, a temperatura sobe e a velocidade
-de rotação cai — sinais que o modelo detecta antes de a peça falhar de vez.
+SAV — Starter Air Valve health monitoring
+Displays the 5 key degradation signals per engine side (LH / RH).
 """
 
 import pandas as pd
@@ -13,167 +10,234 @@ import streamlit as st
 
 from utils.drive_loader import load
 
-st.set_page_config(page_title="SAV — Motor Starter", layout="wide")
+st.set_page_config(page_title="SAV — Starter Air Valve", layout="wide")
 
-st.title("⚙️ Motor Starter (SAV)")
+st.title("⚙️ Starter Air Valve (SAV)")
 st.markdown(
-    "O **starter** é o motor que dá a partida ao motor principal. "
-    "Falhas no starter causam atrasos ou AOG. "
-    "O modelo detecta sinais de desgaste **até 80 voos antes** da falha."
+    "The starter valve opens to drive the turbine during engine start. "
+    "As it degrades it opens **slower**, stays open **longer**, oscillates, "
+    "and the engine reaches **lower peak N2** — all detectable before failure."
 )
 
-# ── Dados ─────────────────────────────────────────────────────────────────────
+# ── Data ──────────────────────────────────────────────────────────────────────
 df_lh = load("e2_sav_lh_report.parquet")
 df_rh = load("e2_sav_rh_report.parquet")
 
 if df_lh.empty and df_rh.empty:
-    st.error("Dados ainda não disponíveis. Execute o job `save_sav_report` no Dagster.")
+    st.error("No data yet. Run the `save_sav_report` job in Dagster.")
     st.stop()
 
 for df in (df_lh, df_rh):
     if "date" in df.columns:
         df["date"] = pd.to_datetime(df["date"], errors="coerce")
+    if "ac_sn" in df.columns:
+        df["ac_sn"] = df["ac_sn"].astype(str)
 
-# Filtro de aeronave
-all_ac = sorted(
-    set(df_lh["ac_sn"].dropna().astype(int).unique().tolist() if "ac_sn" in df_lh.columns else [])
-    | set(df_rh["ac_sn"].dropna().astype(int).unique().tolist() if "ac_sn" in df_rh.columns else [])
-)
-selected = st.multiselect("Filtrar aeronave(s)", options=all_ac, default=all_ac[:10] if len(all_ac) > 10 else all_ac)
+# ── Sidebar controls ──────────────────────────────────────────────────────────
+with st.sidebar:
+    st.header("Filters")
+    days_back = st.slider("Days of history", 30, 365, 120)
+    all_ac = sorted(
+        set(df_lh["ac_sn"].dropna().unique().tolist() if "ac_sn" in df_lh.columns else [])
+        | set(df_rh["ac_sn"].dropna().unique().tolist() if "ac_sn" in df_rh.columns else [])
+    )
+    selected_ac = st.multiselect("Aircraft (MSN)", options=all_ac, default=all_ac)
 
-if selected:
-    if "ac_sn" in df_lh.columns:
-        df_lh = df_lh[df_lh["ac_sn"].astype(int).isin(selected)]
-    if "ac_sn" in df_rh.columns:
-        df_rh = df_rh[df_rh["ac_sn"].astype(int).isin(selected)]
+cutoff = pd.Timestamp.now() - pd.Timedelta(days=days_back)
+
+def _filter(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return df
+    if selected_ac and "ac_sn" in df.columns:
+        df = df[df["ac_sn"].isin(selected_ac)]
+    if "date" in df.columns:
+        df = df[df["date"] >= cutoff]
+    return df.dropna(subset=["date"]).sort_values("date")
+
+df_lh = _filter(df_lh)
+df_rh = _filter(df_rh)
+
+# ── KPIs ──────────────────────────────────────────────────────────────────────
+def _alert_count(df: pd.DataFrame, pred_col: str) -> int:
+    if df.empty or pred_col not in df.columns or "ac_sn" not in df.columns:
+        return 0
+    return int(df.sort_values("date").groupby("ac_sn").last()[pred_col].eq(1).sum())
+
+c1, c2, c3, c4 = st.columns(4)
+c1.metric("Aircraft monitored (LH)", df_lh["ac_sn"].nunique() if "ac_sn" in df_lh.columns else 0)
+c2.metric("🔴 In alert — LH", _alert_count(df_lh, "pre_lh_sav_failure_prediction"))
+c3.metric("Aircraft monitored (RH)", df_rh["ac_sn"].nunique() if "ac_sn" in df_rh.columns else 0)
+c4.metric("🔴 In alert — RH", _alert_count(df_rh, "pre_rh_sav_failure_prediction"))
 
 st.divider()
 
-# ── KPIs ──────────────────────────────────────────────────────────────────────
-def _latest_risk(df: pd.DataFrame, pred_col: str):
-    """Retorna DataFrame com última predição por aeronave."""
-    if df.empty or pred_col not in df.columns:
-        return pd.DataFrame()
-    return (
-        df.dropna(subset=["date", "ac_sn"])
-        .sort_values("date")
-        .groupby("ac_sn")
-        .last()[[pred_col, "date"]]
-        .reset_index()
+# ── Signal definitions — maps friendly name → (lh_col, rh_col, unit, description) ─
+SIGNALS = {
+    "Valve Opening Time": (
+        "time_to_open_ats_vlv_1", "time_to_open_ats_vlv_2",
+        "seconds", "Rising trend indicates valve is stiffening (degraded actuator or contamination).",
+        "up",  # "up" = rising is bad
+    ),
+    "Valve Closing / Response Time": (
+        "time_with_ats_vlv_closed_and_rpm_above_0-1a", "time_with_ats_vlv_closed_and_rpm_above_0-3a",
+        "seconds", "Time the valve remains closed while shaft is still spinning — prolonged = slow response.",
+        "up",
+    ),
+    "Total Valve Open Time": (
+        "time_with_ats_vlv_open-1a", "time_with_ats_vlv_open-3a",
+        "seconds", "Abnormally long open time suggests valve is not closing cleanly or start is laboured.",
+        "up",
+    ),
+    "Max N2 Speed at Start": (
+        "max_ats_rpm_with_n2_above_50-1a", "max_ats_rpm_with_n2_above_50-3a",
+        "%RPM", "Peak N2 reached during start — falling trend means less torque delivered (wear).",
+        "down",  # "down" = falling is bad
+    ),
+    "Valve Oscillation Count": (
+        "ats_oscillation-1a", "ats_oscillation-3a",
+        "count", "Number of pressure oscillations during start — rising = unstable valve behavior.",
+        "up",
+    ),
+}
+
+# Fallback column names for oscillation (some datasets use different naming)
+_OSCILLATION_FALLBACKS = {
+    "ats_oscillation-1a": ["ats_mts_oscillation_count-1a", "oscillation_count_lh", "ats_osc_count-1a"],
+    "ats_oscillation-3a": ["ats_mts_oscillation_count-3a", "oscillation_count_rh", "ats_osc_count-3a"],
+}
+
+def _resolve_col(df: pd.DataFrame, col: str) -> str | None:
+    if col in df.columns:
+        return col
+    for alt in _OSCILLATION_FALLBACKS.get(col, []):
+        if alt in df.columns:
+            return alt
+    return None
+
+
+def _trend_chart(df: pd.DataFrame, col: str, title: str, unit: str, bad_dir: str) -> go.Figure:
+    df_plot = df.dropna(subset=[col]).copy()
+    if df_plot.empty:
+        return None
+
+    fig = px.scatter(
+        df_plot,
+        x="date", y=col,
+        color="ac_sn",
+        labels={col: f"{title} ({unit})", "date": "", "ac_sn": "MSN"},
+        title=title,
+        opacity=0.55,
+        trendline="lowess",
+        trendline_scope="overall",
+        trendline_color_override="black",
     )
+    # Add an annotation zone
+    p_bad = df_plot[col].quantile(0.90 if bad_dir == "up" else 0.10)
+    if bad_dir == "up":
+        fig.add_hrect(y0=p_bad, y1=df_plot[col].max() * 1.05,
+                      fillcolor="red", opacity=0.06,
+                      annotation_text="degradation zone (P90)", annotation_position="top left")
+    else:
+        fig.add_hrect(y0=df_plot[col].min() * 0.95, y1=p_bad,
+                      fillcolor="red", opacity=0.06,
+                      annotation_text="degradation zone (P10)", annotation_position="bottom left")
+
+    fig.update_traces(selector=dict(mode="markers"), marker_size=5)
+    fig.update_layout(
+        height=300,
+        margin=dict(t=40, b=20, l=10, r=10),
+        xaxis=dict(tickformat="%d-%b-%y"),
+        legend_title_text="MSN",
+    )
+    return fig
 
 
-risk_lh = _latest_risk(df_lh, "pre_lh_sav_failure_prediction")
-risk_rh = _latest_risk(df_rh, "pre_rh_sav_failure_prediction")
+# ── Tabs LH / RH ──────────────────────────────────────────────────────────────
+tab_lh, tab_rh, tab_status = st.tabs(["Engine 1 — LH", "Engine 2 — RH", "Current Risk Status"])
 
-c1, c2, c3, c4 = st.columns(4)
-c1.metric("Aeronaves monitoradas (LH)", len(risk_lh))
-c2.metric("🔴 Em alerta (LH)", int((risk_lh["pre_lh_sav_failure_prediction"] == 1).sum()) if not risk_lh.empty else 0)
-c3.metric("Aeronaves monitoradas (RH)", len(risk_rh))
-c4.metric("🔴 Em alerta (RH)", int((risk_rh["pre_rh_sav_failure_prediction"] == 1).sum()) if not risk_rh.empty else 0)
-
-# ── Gráfico 1: situação atual por aeronave ─────────────────────────────────────
-st.subheader("Situação atual — último voo registrado")
-st.caption("Verde = sem alerta   |   Vermelho = modelo detectou pré-falha")
-
-col_a, col_b = st.columns(2)
-
-for side, risk_df, pred_col, title in [
-    ("LH", risk_lh, "pre_lh_sav_failure_prediction", "Starter Esquerdo (LH)"),
-    ("RH", risk_rh, "pre_rh_sav_failure_prediction", "Starter Direito (RH)"),
-]:
-    with (col_a if side == "LH" else col_b):
-        if risk_df.empty:
-            st.info(f"Sem dados para {title}.")
-            continue
-        risk_df = risk_df.copy()
-        risk_df["status"] = risk_df[pred_col].map({0: "Normal", 1: "Alerta"})
-        risk_df["cor"] = risk_df[pred_col].map({0: "#22c55e", 1: "#ef4444"})
-        risk_df["ac_sn"] = risk_df["ac_sn"].astype(str)
-        risk_df = risk_df.sort_values(pred_col, ascending=False)
-
-        fig = go.Figure(go.Bar(
-            y=risk_df["ac_sn"],
-            x=risk_df[pred_col],
-            orientation="h",
-            marker_color=risk_df["cor"],
-            text=risk_df["status"],
-            textposition="inside",
-        ))
-        fig.update_layout(
-            title=title,
-            xaxis=dict(tickvals=[0, 1], ticktext=["Normal", "Alerta"], range=[0, 1.1]),
-            yaxis_title="Aeronave",
-            height=max(300, len(risk_df) * 28),
-            margin=dict(l=10, r=10, t=40, b=10),
-        )
-        st.plotly_chart(fig, use_container_width=True)
-
-# ── Gráfico 2: linha do tempo de alertas ──────────────────────────────────────
-st.subheader("Histórico de alertas — quando cada aeronave esteve em risco")
-st.caption("Cada linha é uma aeronave. Pontos vermelhos = voos com alerta detectado.")
-
-tab_lh, tab_rh = st.tabs(["Starter Esquerdo (LH)", "Starter Direito (RH)"])
-
-for tab, df, pred_col, speed_col, itt_col, label in [
-    (tab_lh, df_lh, "pre_lh_sav_failure_prediction", "starterSpeed-1a_max", "ittFADEC-1a_max", "LH"),
-    (tab_rh, df_rh, "pre_rh_sav_failure_prediction", "starterSpeed-3a_max", "ittFADEC-3a_max", "RH"),
+for tab, df, pred_col, side_label, col_idx in [
+    (tab_lh, df_lh, "pre_lh_sav_failure_prediction", "LH", 0),
+    (tab_rh, df_rh, "pre_rh_sav_failure_prediction", "RH", 1),
 ]:
     with tab:
-        if df.empty or pred_col not in df.columns:
-            st.info("Sem dados.")
+        if df.empty:
+            st.info(f"No data available for {side_label}.")
             continue
 
-        df = df.dropna(subset=["date"]).copy()
-        df["ac_sn"] = df["ac_sn"].astype(str)
-        df["Resultado"] = df[pred_col].map({0: "Normal", 1: "⚠️ Alerta"})
+        rendered = 0
+        for signal_name, (lh_col, rh_col, unit, caption, bad_dir) in SIGNALS.items():
+            raw_col = lh_col if col_idx == 0 else rh_col
+            col = _resolve_col(df, raw_col)
+            if col is None:
+                continue
 
-        # Timeline
-        fig_hist = px.scatter(
-            df, x="date", y="ac_sn",
-            color="Resultado",
-            color_discrete_map={"Normal": "#86efac", "⚠️ Alerta": "#ef4444"},
-            labels={"date": "Data", "ac_sn": "Aeronave"},
-            title=f"Starter {label} — alertas ao longo do tempo",
-        )
-        fig_hist.update_traces(marker_size=6)
-        fig_hist.update_layout(height=350)
-        st.plotly_chart(fig_hist, use_container_width=True)
+            fig = _trend_chart(df, col, f"{signal_name} — {side_label}", unit, bad_dir)
+            if fig is None:
+                continue
 
-        col1, col2 = st.columns(2)
+            st.plotly_chart(fig, use_container_width=True)
+            st.caption(f"_{caption}_")
+            rendered += 1
 
-        # Velocidade do starter
-        if speed_col in df.columns:
-            with col1:
-                fig_spd = px.line(
-                    df.sort_values("date"), x="date", y=speed_col,
-                    color="ac_sn",
-                    title="Velocidade de rotação do Starter (%RPM)",
-                    labels={speed_col: "Velocidade (%)", "date": "", "ac_sn": "Aeronave"},
+        if rendered == 0:
+            st.warning(
+                "The key degradation columns are not present in this dataset yet. "
+                "Run the SAV feature-engineering pipeline to populate them."
+            )
+            # Show alert timeline as fallback
+            if pred_col in df.columns and "ac_sn" in df.columns:
+                df_alert = df.copy()
+                df_alert["Status"] = df_alert[pred_col].map({0: "Normal", 1: "⚠️ Alert"})
+                fig_fallback = px.scatter(
+                    df_alert, x="date", y="ac_sn",
+                    color="Status",
+                    color_discrete_map={"Normal": "#86efac", "⚠️ Alert": "#ef4444"},
+                    labels={"date": "", "ac_sn": "MSN"},
+                    title=f"Alert timeline — {side_label}",
                 )
-                fig_spd.add_hrect(
-                    y0=0, y1=df[speed_col].quantile(0.10),
-                    fillcolor="red", opacity=0.08,
-                    annotation_text="zona de risco", annotation_position="top left",
+                fig_fallback.update_traces(marker_size=6)
+                fig_fallback.update_layout(
+                    height=max(250, df_alert["ac_sn"].nunique() * 30),
+                    xaxis=dict(tickformat="%d-%b-%y"),
                 )
-                fig_spd.update_layout(height=320, showlegend=False)
-                st.plotly_chart(fig_spd, use_container_width=True)
-                st.caption("⬇️ Velocidade caindo ao longo do tempo indica desgaste progressivo.")
+                st.plotly_chart(fig_fallback, use_container_width=True)
 
-        # Temperatura ITT
-        if itt_col in df.columns:
-            with col2:
-                fig_itt = px.line(
-                    df.sort_values("date"), x="date", y=itt_col,
-                    color="ac_sn",
-                    title="Temperatura no arranque — ITT (°C)",
-                    labels={itt_col: "Temperatura (°C)", "date": "", "ac_sn": "Aeronave"},
-                )
-                p90 = df[itt_col].quantile(0.90)
-                fig_itt.add_hline(
-                    y=p90, line_dash="dot", line_color="orange",
-                    annotation_text="limite atenção (P90)", annotation_position="top right",
-                )
-                fig_itt.update_layout(height=320, showlegend=False)
-                st.plotly_chart(fig_itt, use_container_width=True)
-                st.caption("⬆️ Temperatura acima do normal pode indicar arranque quente (hot-start).")
+# ── Current Risk Status ────────────────────────────────────────────────────────
+with tab_status:
+    col_left, col_right = st.columns(2)
+
+    for col_widget, df, pred_col, title in [
+        (col_left,  df_lh, "pre_lh_sav_failure_prediction",  "LH — Latest flight risk per aircraft"),
+        (col_right, df_rh, "pre_rh_sav_failure_prediction", "RH — Latest flight risk per aircraft"),
+    ]:
+        with col_widget:
+            if df.empty or pred_col not in df.columns or "ac_sn" not in df.columns:
+                st.info("No data.")
+                continue
+
+            latest = (
+                df.sort_values("date")
+                .groupby("ac_sn")
+                .last()[[pred_col]]
+                .reset_index()
+                .sort_values(pred_col, ascending=False)
+            )
+            latest["Status"] = latest[pred_col].map({0: "Normal", 1: "Alert"})
+            latest["color"] = latest[pred_col].map({0: "#22c55e", 1: "#ef4444"})
+
+            fig_risk = go.Figure(go.Bar(
+                y=latest["ac_sn"].astype(str),
+                x=latest[pred_col],
+                orientation="h",
+                marker_color=latest["color"],
+                text=latest["Status"],
+                textposition="inside",
+            ))
+            fig_risk.update_layout(
+                title=title,
+                xaxis=dict(tickvals=[0, 1], ticktext=["Normal", "Alert"], range=[0, 1.2]),
+                yaxis_title="MSN",
+                height=max(300, len(latest) * 28),
+                margin=dict(l=10, r=10, t=40, b=10),
+            )
+            st.plotly_chart(fig_risk, use_container_width=True)
