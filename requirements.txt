@@ -1,7 +1,7 @@
-streamlit==1.35.0
-plotly==5.22.0
-pandas==2.2.2
-pyarrow==16.0.0
-google-api-python-client==2.131.0
-google-auth==2.30.0
-google-auth-httplib2==0.2.0
+streamlit>=1.35.0
+plotly>=5.22.0
+pandas>=2.2.0
+pyarrow>=14.0.0
+google-api-python-client>=2.100.0
+google-auth>=2.25.0
+google-auth-httplib2>=0.2.0
