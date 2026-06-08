@@ -69,3 +69,24 @@ def display_name(msn: str, prefix_map: dict) -> str:
     """'PR-PXA · 20077' if prefix available, else just '20077'."""
     prefix = prefix_map.get(str(msn).strip(), "")
     return f"{prefix} · {msn}" if prefix else str(msn)
+
+
+def clean_df(
+    df: pd.DataFrame,
+    date_col: str = "date",
+    ac_col: str | None = None,
+    prefix_map: dict | None = None,
+) -> pd.DataFrame:
+    """Remove obviously bad rows:
+    - Future dates (> today + 1-day tolerance)
+    - Serials absent from ac_master (only when prefix_map is non-empty)
+    """
+    if df.empty:
+        return df
+    today = pd.Timestamp.now().normalize()
+    if date_col in df.columns:
+        df = df[df[date_col].notna() & (df[date_col] <= today + pd.Timedelta(days=1))]
+    if ac_col and ac_col in df.columns and prefix_map:
+        valid = set(prefix_map.keys())
+        df = df[df[ac_col].astype(str).isin(valid)]
+    return df.reset_index(drop=True)

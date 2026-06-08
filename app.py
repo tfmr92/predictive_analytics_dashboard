@@ -1,6 +1,6 @@
 """
-Home — Azul E2 Predictive Maintenance Dashboard
-Summary KPIs + mini trend charts for all monitored systems.
+Home — Azul Fleet Predictive Maintenance Dashboard
+Summary KPIs + mini trend charts for all monitored systems (E2, ATR, Airbus).
 """
 
 import pandas as pd
@@ -10,13 +10,13 @@ import streamlit as st
 from utils.drive_loader import load
 
 st.set_page_config(
-    page_title="Azul E2 — Predictive Maintenance",
+    page_title="Azul Fleet — Predictive Maintenance",
     page_icon="✈️",
     layout="wide",
 )
 
-st.title("✈️ Azul E2 — Predictive Maintenance")
-st.caption("Refreshed automatically with every Dagster run · data lag ≤ 1 h")
+st.title("✈️ Azul Fleet — Predictive Maintenance")
+st.caption("E195-E2 · ATR 72 · A320 / A330 · Refreshed automatically · data lag ≤ 1 h")
 
 # ── Load data ──────────────────────────────────────────────────────────────────
 df_sav_lh = load("e2_sav_lh_report.parquet")

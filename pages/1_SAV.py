@@ -8,7 +8,7 @@ import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
 
-from utils.drive_loader import load
+from utils.drive_loader import load, clean_df, make_prefix_map
 
 st.set_page_config(page_title="SAV — Starter Air Valve", layout="wide")
 
@@ -36,6 +36,11 @@ for df in (df_lh, df_rh):
         df["date"] = pd.to_datetime(df["date"], errors="coerce")
     if "ac_sn" in df.columns:
         df["ac_sn"] = df["ac_sn"].astype(str)
+
+# Filter future dates and invalid serials
+_prefix_map = make_prefix_map()
+df_lh = clean_df(df_lh, date_col="date", ac_col="ac_sn", prefix_map=_prefix_map)
+df_rh = clean_df(df_rh, date_col="date", ac_col="ac_sn", prefix_map=_prefix_map)
 
 # ── Full unfiltered fleet (safety alerts must never inherit the sidebar filter) ──
 def _full_fleet(df: pd.DataFrame) -> pd.DataFrame:

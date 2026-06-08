@@ -14,7 +14,7 @@ import plotly.graph_objects as go
 import numpy as np
 import streamlit as st
 
-from utils.drive_loader import load
+from utils.drive_loader import load, make_prefix_map, display_name, clean_df
 
 st.set_page_config(page_title="Wheels & Brakes", layout="wide")
 
@@ -65,6 +65,13 @@ if "date" in df.columns:
 if "ac_sn" in df.columns:
     df["ac_sn"] = df["ac_sn"].astype(str)
 
+# Filter future dates and invalid serials; build display names
+_prefix_map = make_prefix_map()
+df = clean_df(df, date_col="date", ac_col="ac_sn", prefix_map=_prefix_map)
+if "ac_sn" in df.columns:
+    df["_display"] = df["ac_sn"].map(lambda msn: display_name(msn, _prefix_map))
+_disp_col = "_display" if "_display" in df.columns else "ac_sn"
+
 # ── Data freshness indicator ─────────────────────────────────────
 if "date" in df.columns:
     _latest_event = df["date"].max()
@@ -85,7 +92,7 @@ if "date" in df.columns:
 with st.sidebar:
     st.header("Filters")
     days_back = st.slider("Days of history", 30, 365, 120)
-    all_ac = sorted(df["ac_sn"].dropna().unique().tolist()) if "ac_sn" in df.columns else []
+    all_ac = sorted(df[_disp_col].dropna().unique().tolist()) if _disp_col in df.columns else []
     selected_ac = st.multiselect("Aircraft (MSN)", options=all_ac, default=all_ac)
     WHEEL_LIFE = st.number_input(
         "Assumed wheel life (cycles)", min_value=500, max_value=5000, value=WHEEL_LIFE_DEF,
@@ -101,8 +108,8 @@ with st.sidebar:
     st.caption(f"Threshold at {MZFW_KG:,} kg: **{_weight_adjusted_g_limit(MZFW_KG):.2f} g**")
 
 cutoff = pd.Timestamp.now() - pd.Timedelta(days=days_back)
-if selected_ac and "ac_sn" in df.columns:
-    df = df[df["ac_sn"].isin(selected_ac)]
+if selected_ac and _disp_col in df.columns:
+    df = df[df[_disp_col].isin(selected_ac)]
 if "date" in df.columns:
     df = df[df["date"] >= cutoff].dropna(subset=["date"]).sort_values("date")
 
@@ -480,3 +487,138 @@ with tab_bounce:
             st.plotly_chart(fig_mb, use_container_width=True)
     else:
         st.info("Bounce count columns not available in current data.")
+
+st.divider()
+
+# ── Section 5: Life Analysis — Weibull ────────────────────────────────────────
+st.subheader("5. Life Analysis — Component Removal History")
+st.caption(
+    "Weibull analysis of historical removal cycles (TRAX data). "
+    "B10 = 10% of units removed by this cycle count; B50 = median removal life. "
+    "Run the Snowflake notebook to refresh maintenance data."
+)
+
+try:
+    from scipy.stats import weibull_min as _weibull
+    import numpy as _np
+
+    _df_wnb_m   = load("e2_wnb_maintenance.parquet")
+    _df_brake_m = load("e2_brake_maintenance.parquet")
+
+    _tab_wheel, _tab_brake = st.tabs(["Wheels (MLG/NLG)", "Brakes"])
+
+    for _tab, _df_m, _comp in [
+        (_tab_wheel, _df_wnb_m,   "Wheel"),
+        (_tab_brake, _df_brake_m, "Brake"),
+    ]:
+        with _tab:
+            if _df_m.empty or "CYCLES_INSTALLED" not in _df_m.columns:
+                st.info(
+                    f"No {_comp.lower()} maintenance data. "
+                    "Run the Snowflake notebook to upload `e2_wnb_maintenance.parquet` / "
+                    "`e2_brake_maintenance.parquet` to Drive."
+                )
+                continue
+
+            _cycles = (
+                pd.to_numeric(_df_m["CYCLES_INSTALLED"], errors="coerce")
+                .dropna()
+                .pipe(lambda s: s[s > 0])
+                .values
+            )
+
+            if len(_cycles) < 5:
+                st.info(f"Not enough data for Weibull fitting ({len(_cycles)} records).")
+                continue
+
+            _shape, _loc, _scale = _weibull.fit(_cycles, floc=0)
+            _b10 = _weibull.ppf(0.10, _shape, _loc, _scale)
+            _b50 = _weibull.ppf(0.50, _shape, _loc, _scale)
+            _x   = _np.linspace(0, _cycles.max() * 1.15, 300)
+            _pdf = _weibull.pdf(_x, _shape, _loc, _scale)
+
+            _col_h, _col_w = st.columns(2)
+
+            with _col_h:
+                fig_ch = px.histogram(
+                    x=_cycles, nbins=25,
+                    labels={"x": "Cycles at Removal", "count": "Removals"},
+                    title=f"{_comp} — Removal Cycles Distribution",
+                    color_discrete_sequence=["#64748b"],
+                )
+                fig_ch.add_vline(
+                    x=WHEEL_LIFE, line_dash="dash", line_color="red",
+                    annotation_text=f"Current threshold ({WHEEL_LIFE}c)",
+                    annotation_position="top right",
+                )
+                fig_ch.update_layout(height=320, showlegend=False)
+                st.plotly_chart(fig_ch, use_container_width=True)
+
+            with _col_w:
+                fig_wb = go.Figure()
+                fig_wb.add_histogram(
+                    x=_cycles, name="Observed removals",
+                    histnorm="probability density",
+                    marker_color="steelblue", opacity=0.55,
+                )
+                fig_wb.add_scatter(
+                    x=_x, y=_pdf, mode="lines",
+                    name=f"Weibull (β={_shape:.2f}, η={_scale:.0f}c)",
+                    line=dict(color="#f59e0b", width=2.5),
+                )
+                fig_wb.add_vline(x=_b10, line_dash="dot", line_color="#ef4444",
+                                 annotation_text=f"B10 = {_b10:.0f}c",
+                                 annotation_position="top right")
+                fig_wb.add_vline(x=_b50, line_dash="dot", line_color="#64748b",
+                                 annotation_text=f"B50 = {_b50:.0f}c",
+                                 annotation_position="top right")
+                fig_wb.add_vline(x=WHEEL_LIFE, line_dash="dash", line_color="red",
+                                 annotation_text=f"Maint. threshold ({WHEEL_LIFE}c)",
+                                 annotation_position="bottom right")
+                fig_wb.update_layout(
+                    title=f"{_comp} Removal Life — Weibull  (n={len(_cycles)} events)",
+                    xaxis_title="Cycles at Removal",
+                    yaxis_title="Probability Density",
+                    height=320,
+                    legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+                )
+                st.plotly_chart(fig_wb, use_container_width=True)
+
+            st.caption(
+                f"**B10 = {_b10:.0f} cycles** — 10% of {_comp.lower()}s removed by this point.  "
+                f"**B50 = {_b50:.0f} cycles** — median removal life.  "
+                f"Current threshold set to **{WHEEL_LIFE} cycles**."
+            )
+
+            # Per-position Weibull summary table
+            if "POSITION" in _df_m.columns:
+                _positions = _df_m["POSITION"].dropna().unique()
+                if len(_positions) > 1:
+                    _pos_rows = []
+                    for _pos in sorted(_positions):
+                        _pc = (
+                            pd.to_numeric(
+                                _df_m.loc[_df_m["POSITION"] == _pos, "CYCLES_INSTALLED"],
+                                errors="coerce",
+                            )
+                            .dropna()
+                            .pipe(lambda s: s[s > 0])
+                            .values
+                        )
+                        if len(_pc) >= 3:
+                            _ps, _pl, _psc = _weibull.fit(_pc, floc=0)
+                            _pos_rows.append({
+                                "Position": _pos,
+                                "N": len(_pc),
+                                "B10 (cycles)": round(_weibull.ppf(0.10, _ps, _pl, _psc)),
+                                "B50 (cycles)": round(_weibull.ppf(0.50, _ps, _pl, _psc)),
+                                "Mean (cycles)": round(float(_pc.mean())),
+                            })
+                    if _pos_rows:
+                        st.dataframe(
+                            pd.DataFrame(_pos_rows),
+                            use_container_width=True, hide_index=True,
+                        )
+
+except ImportError:
+    st.info("scipy not installed — add `scipy>=1.12.0` to requirements.txt.")

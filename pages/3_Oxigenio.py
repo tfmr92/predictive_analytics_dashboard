@@ -10,7 +10,7 @@ import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
 
-from utils.drive_loader import load, make_prefix_map, display_name
+from utils.drive_loader import load, make_prefix_map, display_name, clean_df
 
 st.set_page_config(page_title="Oxygen System", layout="wide")
 
@@ -40,8 +40,11 @@ if "date" in df.columns:
 if AC_COL:
     df[AC_COL] = df[AC_COL].astype(str)
 
-# Add display column (prefix · MSN) — falls back to MSN if ac_master unavailable
+# Filter future dates and invalid serials
 prefix_map = make_prefix_map()
+df = clean_df(df, date_col="date", ac_col=AC_COL, prefix_map=prefix_map)
+
+# Add display column (prefix · MSN) — falls back to MSN if ac_master unavailable
 if AC_COL:
     df["_display"] = df[AC_COL].map(lambda msn: display_name(msn, prefix_map))
 DISP_COL = "_display" if "_display" in df.columns else AC_COL
@@ -489,3 +492,107 @@ if "delta_press" in df.columns and "date" in df.columns:
     )
     with st.expander("Top 15 highest single-day pressure drop events"):
         st.dataframe(top, use_container_width=True, hide_index=True)
+
+st.divider()
+
+# ── Section 6: Life Analysis — PSI Drop Histogram + Weibull ──────────────────
+st.subheader("6. Life Analysis — Oxygen Charge Duration")
+st.caption(
+    "Left: distribution of PSI drops per flight (shows variance in daily consumption). "
+    "Right: Weibull model fitted on the days between consecutive recharge events — "
+    "B10/B50 guide proactive maintenance scheduling."
+)
+
+col_hist, col_weib = st.columns(2)
+
+with col_hist:
+    if "delta_press" in df.columns:
+        _drops = df.dropna(subset=["delta_press"]).copy()
+        _drops = _drops[_drops["delta_press"] > 0]
+        if not _drops.empty:
+            _fleet_avg_drop = _drops["delta_press"].mean()
+            fig_hist = px.histogram(
+                _drops, x="delta_press",
+                nbins=30,
+                labels={"delta_press": "PSI Drop per Flight", "count": "Flights"},
+                title="PSI Drop per Flight — Distribution",
+                color_discrete_sequence=["#64748b"],
+            )
+            fig_hist.add_vline(
+                x=_fleet_avg_drop, line_dash="dash", line_color="#f59e0b",
+                annotation_text=f"Fleet avg ({_fleet_avg_drop:.1f} PSI/flt)",
+                annotation_position="top right",
+            )
+            fig_hist.update_layout(height=340, showlegend=False)
+            st.plotly_chart(fig_hist, use_container_width=True)
+        else:
+            st.info("No PSI drop data in current selection.")
+    else:
+        st.info("`delta_press` column not available.")
+
+with col_weib:
+    if "psi" in df.columns and AC_COL:
+        try:
+            from scipy.stats import weibull_min as _weibull
+            import numpy as _np
+
+            _ds = (
+                df.dropna(subset=["psi", AC_COL, "date"])
+                .sort_values([AC_COL, "date"])
+                .copy()
+            )
+            _ds["_pdiff"] = _ds.groupby(AC_COL)["psi"].diff()
+            _intervals: list[float] = []
+            for _, _grp in _ds.groupby(AC_COL):
+                _rdates = _grp.loc[_grp["_pdiff"] > RECHARGE_THRESHOLD, "date"].tolist()
+                for _i in range(1, len(_rdates)):
+                    _d = (_rdates[_i] - _rdates[_i - 1]).days
+                    if _d > 0:
+                        _intervals.append(float(_d))
+
+            if len(_intervals) >= 5:
+                _arr = _np.array(_intervals)
+                _shape, _loc, _scale = _weibull.fit(_arr, floc=0)
+                _b10 = _weibull.ppf(0.10, _shape, _loc, _scale)
+                _b50 = _weibull.ppf(0.50, _shape, _loc, _scale)
+                _x   = _np.linspace(0, _arr.max() * 1.15, 300)
+                _pdf = _weibull.pdf(_x, _shape, _loc, _scale)
+
+                fig_w = go.Figure()
+                fig_w.add_histogram(
+                    x=_arr, name="Observed",
+                    histnorm="probability density",
+                    marker_color="steelblue", opacity=0.55,
+                )
+                fig_w.add_scatter(
+                    x=_x, y=_pdf, mode="lines",
+                    name=f"Weibull (β={_shape:.2f}, η={_scale:.0f}d)",
+                    line=dict(color="#f59e0b", width=2.5),
+                )
+                fig_w.add_vline(x=_b10, line_dash="dot", line_color="#ef4444",
+                                annotation_text=f"B10 = {_b10:.0f}d",
+                                annotation_position="top right")
+                fig_w.add_vline(x=_b50, line_dash="dot", line_color="#64748b",
+                                annotation_text=f"B50 = {_b50:.0f}d",
+                                annotation_position="top right")
+                fig_w.update_layout(
+                    title=f"Charge Service Life — Weibull  (n={len(_arr)} intervals)",
+                    xaxis_title="Days Between Recharges",
+                    yaxis_title="Probability Density",
+                    height=340,
+                    legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+                )
+                st.plotly_chart(fig_w, use_container_width=True)
+                st.caption(
+                    f"**B10 = {_b10:.0f} days** — 10% of charges deplete by this point.  "
+                    f"**B50 = {_b50:.0f} days** — median charge service life."
+                )
+            else:
+                st.info(
+                    f"Need ≥ 5 recharge intervals for Weibull fitting "
+                    f"(found {len(_intervals)}). Expand the history window."
+                )
+        except ImportError:
+            st.info("scipy not installed — add `scipy>=1.12.0` to requirements.txt.")
+    else:
+        st.info("PSI column not available for Weibull analysis.")

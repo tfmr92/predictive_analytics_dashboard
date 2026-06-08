@@ -10,7 +10,7 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
-from utils.drive_loader import load, make_prefix_map, display_name
+from utils.drive_loader import load, make_prefix_map, display_name, clean_df
 
 st.set_page_config(page_title="Fleet Overview", layout="wide", page_icon="🗺️")
 
@@ -43,6 +43,13 @@ def _load_all() -> dict:
 
 data = _load_all()
 prefix_map = make_prefix_map()
+
+# Filter future dates and invalid serials from all E2 datasets
+_e2_keys = ("sav_lh", "sav_rh", "oxy", "foqa", "wnb", "fuel")
+for _k in _e2_keys:
+    if _k in data and not data[_k].empty:
+        _ac = next((c for c in ("ac_sn", "aircraftSerNum-1") if c in data[_k].columns), None)
+        data[_k] = clean_df(data[_k], date_col="date", ac_col=_ac, prefix_map=prefix_map)
 
 # ── Sidebar ───────────────────────────────────────────────────────────────────
 with st.sidebar:

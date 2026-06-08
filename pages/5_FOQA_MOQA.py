@@ -11,7 +11,7 @@ import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
 
-from utils.drive_loader import load
+from utils.drive_loader import load, clean_df, make_prefix_map
 
 st.set_page_config(page_title="FOQA / MOQA", layout="wide", page_icon="🔍")
 
@@ -147,6 +147,10 @@ else:
     st.info("No dated flights available to assess data freshness.")
 
 ac_col = 'ac_sn' if 'ac_sn' in df.columns else None
+
+# Filter future dates and invalid serials
+_foqa_prefix_map = make_prefix_map()
+df = clean_df(df, date_col='date', ac_col=ac_col, prefix_map=_foqa_prefix_map)
 
 # Unfiltered snapshot — safety triage must not inherit cosmetic sidebar filters
 df_full = df.copy()

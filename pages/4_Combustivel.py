@@ -9,7 +9,7 @@ import plotly.graph_objects as go
 import numpy as np
 import streamlit as st
 
-from utils.drive_loader import load
+from utils.drive_loader import load, clean_df, make_prefix_map
 
 st.set_page_config(page_title="Fuel Consumption", layout="wide")
 
@@ -33,6 +33,10 @@ if "date" in df.columns:
 AC_COL = next((c for c in ("ac_sn", "aircraftSerNum-1") if c in df.columns), None)
 if AC_COL:
     df[AC_COL] = df[AC_COL].astype(str)
+
+# Filter future dates and invalid serials
+_fuel_prefix_map = make_prefix_map()
+df = clean_df(df, date_col="date", ac_col=AC_COL, prefix_map=_fuel_prefix_map)
 
 # ── Sidebar controls ────────────────────────────────────────────
 with st.sidebar:
