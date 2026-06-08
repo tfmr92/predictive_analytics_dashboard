@@ -47,3 +47,25 @@ def load(filename: str) -> pd.DataFrame:
 
     buf.seek(0)
     return pd.read_parquet(buf)
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def load_ac_master() -> pd.DataFrame:
+    """Returns ac_master.parquet with TCRF_SN and AC (registration) columns."""
+    return load("ac_master.parquet")
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def make_prefix_map() -> dict:
+    """Returns {TCRF_SN: registration} e.g. {'20077': 'PR-PXA'}.
+    Empty dict when ac_master is unavailable (prefix display degrades gracefully)."""
+    df = load_ac_master()
+    if df.empty or "TCRF_SN" not in df.columns or "AC" not in df.columns:
+        return {}
+    return dict(zip(df["TCRF_SN"].astype(str).str.strip(), df["AC"].astype(str).str.strip()))
+
+
+def display_name(msn: str, prefix_map: dict) -> str:
+    """'PR-PXA · 20077' if prefix available, else just '20077'."""
+    prefix = prefix_map.get(str(msn).strip(), "")
+    return f"{prefix} · {msn}" if prefix else str(msn)

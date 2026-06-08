@@ -18,7 +18,7 @@ from utils.drive_loader import load
 
 st.set_page_config(page_title="Wheels & Brakes", layout="wide")
 
-# ── AMM constants (ATA 32, MTM-0051-00-Vol18) ─────────────────────────────────
+# ── AMM constants (ATA 32, MTM-0051-00-Vol18) ─────────────────────────────
 MLW_KG          = 48_000   # E195-E2 max landing weight (kg)
 MZFW_KG         = 40_200   # max zero fuel weight — approximate lower bound
 G_LIMIT_AT_MLW  = 2.0      # inspection trigger at MLW (conservative)
@@ -53,7 +53,7 @@ st.markdown(
     "Positions requiring formal AMM inspection are highlighted."
 )
 
-# ── Data ──────────────────────────────────────────────────────────────────────
+# ── Data ──────────────────────────────────────────────────────
 df = load("e2_wnb_report.parquet")
 
 if df.empty:
@@ -65,7 +65,23 @@ if "date" in df.columns:
 if "ac_sn" in df.columns:
     df["ac_sn"] = df["ac_sn"].astype(str)
 
-# ── Sidebar controls ──────────────────────────────────────────────────────────
+# ── Data freshness indicator ─────────────────────────────────────
+if "date" in df.columns:
+    _latest_event = df["date"].max()
+    if pd.notna(_latest_event):
+        _age_days = (pd.Timestamp.now().normalize() - _latest_event.normalize()).days
+        _freshness_msg = (
+            f"Latest flight event: **{_latest_event:%d-%b-%Y}** "
+            f"({_age_days} day(s) ago)"
+        )
+        if _age_days <= 2:
+            st.success(_freshness_msg)
+        else:
+            st.warning(f"{_freshness_msg} — wheel/brake data may be stale.")
+    else:
+        st.info("No valid flight dates in the loaded dataset.")
+
+# ── Sidebar controls ──────────────────────────────────────────
 with st.sidebar:
     st.header("Filters")
     days_back = st.slider("Days of history", 30, 365, 120)
@@ -90,7 +106,7 @@ if selected_ac and "ac_sn" in df.columns:
 if "date" in df.columns:
     df = df[df["date"] >= cutoff].dropna(subset=["date"]).sort_values("date")
 
-# ── Weight-adjusted hard landing flags ────────────────────────────────────────
+# ── Weight-adjusted hard landing flags ───────────────────────────────
 for acol, fcol in [("NormAccel_lh", "_hl_flag_lh"), ("NormAccel_rh", "_hl_flag_rh")]:
     if acol in df.columns and "gross_weight" in df.columns:
         df["_g_lim"] = df["gross_weight"].apply(_weight_adjusted_g_limit)
@@ -98,7 +114,7 @@ for acol, fcol in [("NormAccel_lh", "_hl_flag_lh"), ("NormAccel_rh", "_hl_flag_r
     elif acol in df.columns:
         df[fcol] = df[acol] >= G_LIMIT_AT_MLW
 
-# ── Position mapping ──────────────────────────────────────────────────────────
+# ── Position mapping ──────────────────────────────────────────
 _POSITIONS = {
     "mlg1":   ("MLG 1 — LH Fwd",  "prediction_mlg1",   "time_since_installation_1"),
     "mlg2":   ("MLG 2 — LH Aft",  "prediction_mlg2",   "time_since_installation_2"),
@@ -108,7 +124,7 @@ _POSITIONS = {
     "nlg_rh": ("NLG — RH",        "prediction_nlg_rh", "time_since_installation_6"),
 }
 
-# ── KPIs ──────────────────────────────────────────────────────────────────────
+# ── KPIs ───────────────────────────────────────────────────────
 pred_cols = [v[1] for v in _POSITIONS.values() if v[1] in df.columns]
 total_alerts = int(df[pred_cols].eq(1).any(axis=1).sum()) if pred_cols else 0
 ac_in_alert = set()
@@ -128,7 +144,7 @@ c4.metric("⚠️ Hard landings — RH", hard_rh,
 
 st.divider()
 
-# ── Section 1: Removal Priority Table ─────────────────────────────────────────
+# ── Section 1: Removal Priority Table ────────────────────────────────
 st.subheader("1. Removal Priority — Wheels to Act On")
 st.caption(
     "Sorted by urgency: current alert first, then highest alert rate. "
@@ -185,9 +201,12 @@ else:
 
 st.divider()
 
-# ── Section 2: Degradation Heatmap ────────────────────────────────────────────
+# ── Section 2: Degradation Heatmap ──────────────────────────────────
 st.subheader("2. Alert Rate Heatmap — MSN × Wheel Position")
-st.caption("Red = high proportion of flights with removal alert at that position.")
+st.caption(
+    "Color is fixed to an absolute 0–100% scale, so a 5% cell never reads as red "
+    "as a 90% one. Each cell shows the exact alert rate."
+)
 
 available_preds = [v[1] for v in _POSITIONS.values() if v[1] in df.columns]
 pos_labels = {v[1]: v[0] for v in _POSITIONS.values()}
@@ -199,19 +218,25 @@ if available_preds and "ac_sn" in df.columns:
         .rename(columns=pos_labels)
         .reset_index()
     )
-    melted = heatmap_data.melt(id_vars="ac_sn", var_name="Position", value_name="Alert Rate (%)")
-    fig_heat = px.density_heatmap(
-        melted, x="Position", y="ac_sn", z="Alert Rate (%)",
-        color_continuous_scale=["#dcfce7", "#fef9c3", "#fca5a5", "#ef4444"],
-        labels={"ac_sn": "MSN"},
-        title="Wheel Removal Alert Rate (%) — MSN × Position",
-    )
-    fig_heat.update_layout(height=max(300, len(heatmap_data) * 30))
-    st.plotly_chart(fig_heat, use_container_width=True)
+    matrix = heatmap_data.set_index("ac_sn")
+    if matrix.empty or matrix.to_numpy().max() <= 0:
+        st.info("No positive alert rates in the current selection — all positions are clear.")
+    else:
+        fig_heat = px.imshow(
+            matrix,
+            color_continuous_scale=["#dcfce7", "#fef9c3", "#fca5a5", "#ef4444"],
+            zmin=0, zmax=100,
+            text_auto=".0f",
+            aspect="auto",
+            labels={"x": "Position", "y": "MSN", "color": "Alert Rate (%)"},
+            title="Wheel Removal Alert Rate (%) — MSN × Position",
+        )
+        fig_heat.update_layout(height=max(300, len(heatmap_data) * 30))
+        st.plotly_chart(fig_heat, use_container_width=True)
 
 st.divider()
 
-# ── Section 3: Cycles In Service ──────────────────────────────────────────────
+# ── Section 3: Cycles In Service ────────────────────────────────────
 st.subheader("3. Cycles In Service — Progress Toward Removal Threshold")
 st.caption(
     f"Red dashed line = {WHEEL_LIFE}-cycle removal threshold. "
@@ -244,7 +269,7 @@ if tsi_cols_available and "ac_sn" in df.columns:
 
 st.divider()
 
-# ── Section 4: Hard Landing Assessment ────────────────────────────────────────
+# ── Section 4: Hard Landing Assessment ───────────────────────────────
 st.subheader("4. Hard Landing Assessment — AMM MPP7166_05-50-03")
 st.caption(
     "Scatter: peak G-force vs. gross weight. The **curved threshold line** approximates the "

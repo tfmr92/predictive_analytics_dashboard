@@ -1,0 +1,113 @@
+# Dashboard CHANGELOG
+
+Registro automático de melhorias aplicadas pelo `e2_web_platform_agent_job`.
+
+Cada entrada representa uma run diária (07:00) com uma melhoria implementada, validada e auto-avaliada pelo agente Claude. O agente opera em Tiers de qualidade crescente:
+
+- **Tier 1** — Fundação visual e usabilidade
+- **Tier 2** — Gráficos com maior densidade informativa
+- **Tier 3** — Home page executiva
+- **Tier 4** — Comercialização (bloqueado até 2º cliente)
+- **Tier 5** — Preditivo aprofundado
+
+## 2026-05-29 07:00
+- **[Tier 1]** Adicionar @st.cache_data com TTL=300 para queries de parquet
+- Files: `dashboard/pages/1_SAV.py`
+- Rationale: Fallback seguro: caching reduz latência em carregamentos repetidos
+- Self-eval: alignment=5, value=3, quality=7, risk=4
+
+## 2026-05-29 07:00
+- **[Tier 1]** Adicionar @st.cache_data com TTL=300 para queries de parquet
+- Files: `dashboard/pages/1_SAV.py`
+- Rationale: Fallback seguro: caching reduz latência em carregamentos repetidos
+- Self-eval: alignment=5, value=3, quality=7, risk=4
+
+## 2026-05-30 07:00
+- **[Tier 1]** Mover 'from datetime import date' (atualmente na linha 232, no fim do arquivo) para o topo, junto aos demais imports. Hoje 'date.today()' é chamado na linha 226 (st.download_button do Event Log) ANTES de o import ser executado.
+- Files: `dashboard/pages/5_FOQA_MOQA.py`
+- Rationale: Bug latente real, não otimização prematura: o Streamlit executa o script de cima para baixo, então quando 'any_exceedance' tem ao menos um registro, df_exc não fica vazio e a linha 226 chama date.today() — mas 'date' só é importado na linha 232. Resultado: NameError e crash da página EXATAMENTE quando há exceedances ATA 05 reais (a situação mais crítica de segurança, em que o gerente de manutenção mais precisa do log e do export CSV). É a mudança de maior valor e menor risco disponível, alinhada às lições aprendidas (priorizar valor visível ao operador sobre infra invisível) e não toca em 1_SAV.py (alvo das 2 runs anteriores, conforme regra 3).
+- Self-eval: alignment=7, value=7, quality=7, risk=3
+
+## 2026-05-30 07:00
+- **[Tier 1]** Add a 4th KPI card 'Aircraft >5% above fleet avg cruise burn' to the existing KPI row, reusing the same 1.05× fleet-mean threshold already used in Section 2, with a contextual help tooltip explaining the degradation signal.
+- Files: `dashboard/pages/4_Combustivel.py`
+- Rationale: Every page already has KPI cards (the gaps report is stale), so the real Tier 1 gap is that this page's KPIs are descriptive (flights, avg kg) not actionable. The page already computes which aircraft burn >5% above fleet average for a chart; surfacing that count as a header KPI gives a maintenance manager an instant fleet-health signal. Diversified away from SAV/FOQA (last 3 runs), low risk, ~15 lines, all-English, extends rather than replaces.
+- Self-eval: alignment=6, value=5, quality=7, risk=2
+
+## 2026-05-30 07:00
+- **[Tier 1]** Replace the fleet-relative KPI card (c4 'Aircraft >5% above fleet avg cruise burn') with a per-tail degradation signal: count of aircraft whose own cruise-burn linear trend rises >5% across the analyzed window (np.polyfit slope vs. the aircraft's own baseline mean). Centralize the repeated df[cruise_cols].sum(axis=1) into a single df['_cruise_total'] column computed once after cruise_cols is defined, and reuse it in the KPIs and Sections 2/3/4.
+- Files: `dashboard/pages/4_Combustivel.py`
+- Rationale: Directly applies the validated lesson from the 2026-05-30 run: a fleet-relative threshold is statistically guaranteed to flag aircraft (mere dispersion, not degradation) and merely echoes Section 2. A per-tail rising-trend signal uses each aircraft's own baseline — an actionable maintenance trigger, not noise. Centralizing _cruise_total (recomputed at lines 75, 83, 154, 195, 228) removes divergence risk between KPI and charts. Both fixes are explicitly documented in lessons_learned. All other pages already have KPI cards, so the gaps metadata claiming otherwise is stale; the real Tier-1 quality gap is this misleading KPI.
+- Self-eval: alignment=7, value=6, quality=6, risk=2
+
+## 2026-05-30 07:00
+- **[Tier 1]** Add a data-freshness header caption under the SAV title showing the latest flight date present in the loaded dataset (max 'date' across LH+RH, computed before filtering, guarded against empty/NaT), e.g. 'Data through 28-May-2026 · auto-refreshed hourly'.
+- Files: `dashboard/pages/1_SAV.py`
+- Rationale: 1_SAV.py is the only page carrying @st.cache_data(ttl=300), the exact silent-staleness risk flagged repeatedly in runs 2026-05-29 (cache added without any 'last updated' indicator). The top recurring lesson is that in safety-critical aeronautical dashboards data freshness must be explicit and visible. Exposing the dataset's latest flight date directly remediates that documented risk, is the genuine source of freshness available (data comes from Google Drive via load(), so no local file mtime exists), and advances the open Tier 1 'standardized header' item. Diversifies away from Combustivel/FOQA (last 3 runs) and is high-confidence/low-risk.
+- Self-eval: alignment=7, value=6, quality=6, risk=2
+
+## 2026-05-31 07:00
+- **[Tier 1]** Replace the hardcoded cadence claim 'Updated at 07:00 and 19:00' in the subtitle caption (line 15) with a derived staleness indicator computed from the briefing file's real mtime: show the briefing age and color-warn the operator when it is stale. Keep the existing 'Last updated: <timestamp>' line but add an age delta (e.g. 'Generated 3h ago' / 'Generated 2 days ago — pipeline may be stale') and render it via st.success when fresh (<= 18h, covering the ~12h schedule gap) or st.warning when stale (> 18h). All text in English.
+- Files: `dashboard/pages/6_Fleet_Briefing.py`
+- Rationale: Documented transversal lesson: freshness claims must be derived from real refresh state, never hardcoded cadence strings that keep asserting 'hourly/07:00 & 19:00' even after the e2_web_platform_agent_job crashes. This is the weakest dashboard page (44 lines, no sidebar/KPIs) and is not blocked by rule 3 (last 3 runs touched 4_Combustivel x2 and 1_SAV). The fix turns a misleading static label into an actionable safety-relevant signal: an operator instantly sees whether the AI briefing reflects current fleet state or is days old. mtime is already loaded (line 21), so the change is minimal and self-contained.
+- Self-eval: alignment=7, value=7, quality=6, risk=2
+
+## 2026-06-01 07:00
+- **[Tier 1]** Add a data-freshness indicator under the page title showing the latest flight date in the loaded dataset (max of 'date', computed before the days_back filter, guarded against empty/NaT) plus the age delta in days vs. today, rendered via st.success when recent (<= 2 days) or st.warning when stale (> 2 days). No hardcoded cadence claim — the indicator is derived purely from the real max event date.
+- Files: `dashboard/pages/2_Rodas_e_Freios.py`
+- Rationale: Diversifies target (last 3 runs touched 1_SAV/4_Combustivel/5_FOQA/6_Fleet, not this page) and applies the documented transversal freshness lesson: a freshness indicator was added only to 1_SAV and 6_Fleet, leaving the other 4 pages inconsistent. This is a safety-critical operational page where the maintenance manager must know if wheel/brake data is stale. Following the lessons, it distinguishes 'latest event date' from refresh, avoids any hardcoded cadence string, and skips premature caching (no perf complaint).
+- Self-eval: alignment=7, value=6, quality=7, risk=3
+
+## 2026-06-02 07:00
+- **[Tier 1]** Replace the hardcoded cadence claim in the subtitle caption (line 28, 'Refreshed with every TCRF decode') with a derived data-freshness indicator: compute the latest flight date (max of the already-coerced df['date'], guarded against empty/NaT) and the age delta in days vs. today, rendered via st.success when fresh (<=3 days, justified by the daily per-MSN flight cadence) or st.warning when stale ('No new flights ingested in N days — pipeline may be stale'). Keep a static descriptive caption only for the monitored-parameter list, with no cadence assertion. Also fix the leftover Portuguese label '⬇️ Exportar CSV' (line 228) to English '⬇️ Export CSV' per the English-only rule.
+- Files: `dashboard/pages/5_FOQA_MOQA.py`
+- Rationale: FOQA hasn't been touched in the last 5 runs (rule 3 satisfied) and its caption carries exactly the hardcoded-cadence claim the freshness lessons warn against — it would keep asserting freshness even if e2_foqa_moqa_job fails. Deriving the indicator from the real max event date applies the documented transversal lesson without a magic threshold (3 days is anchored to the known daily flight cadence), distinguishes 'latest event date' from a false cadence assertion, and reuses the existing pd.to_datetime coercion (line 37) so the dtype-safety lesson is honored. Fixing 'Exportar CSV' closes an English-only rule violation in the same file with negligible risk.
+- Self-eval: alignment=7, value=6, quality=7, risk=3
+
+## 2026-06-03 07:00
+- **[Tier 2]** Add a 'Fleet Exceedance Heatmap' section right below the fleet KPIs (before the existing tabs): a Plotly heatmap with aircraft (MSN) on the Y axis and exceedance parameters (ITT T/O, N2 vib amber, hard landing, VMO, VLE gear, APU EGT) on the X axis, where each cell is the count of flights in the filtered period that tripped that flag. Build the matrix defensively from the existing boolean flag columns (guard each with df.get(...) and skip columns entirely absent), combine LH/RH ITT and N2 into a single parameter each, render with a white→amber→red colorscale and per-cell hovertemplate showing 'MSN — parameter: N flights'. If no exceedance flags or no positive counts exist, show a polite st.success empty state. All text in English.
+- Files: `dashboard/pages/5_FOQA_MOQA.py`
+- Rationale: Tier 1 is saturated (90%, no advance-blocking) so Tier 2 is unblocked at 0% — this delivers its flagship, demo-worthy item ('Heatmap de excedências por aeronave × parâmetro'). It directly answers the most-repeated lesson across the last 5 runs: aggregate counts are not actionable unless they expose the specific MSNs. The heatmap turns the existing scalar KPI cards into a per-tail, per-parameter hotspot map a maintenance manager can act on instantly. It reuses flag columns already present (itt_*_takeoff_exceedance, n2_vib_*_amber, hard_landing_flag, vmo_exceedance, vle_exceedance, apu_egt_exceedance), so no invented data, and FOQA is the only page with multi-parameter exceedance data so it is the correct home. Last 5 runs were all status/freshness-badge tweaks on 5 different pages; this breaks that pattern with real operational insight.
+- Self-eval: alignment=8, value=8, quality=7, risk=2
+
+## 2026-06-04 07:00
+- **[Tier 2]** Append a new 'Section 5: Per-Aircraft Cruise-Burn Degradation vs Own Baseline' with a drill-down MSN selectbox. For the chosen tail, plot its per-flight cruise fuel over time and overlay an absolute reference baseline (median of that tail's earliest ~30% of flights, min 5 flights required), plus a shaded amber tolerance band (baseline ×1.05–×1.10) and a red zone (> ×1.10). Color each flight marker green/amber/red against its own baseline and show an actionable st.warning/st.success verdict ('MSN X is burning N% above its own baseline — inspect for engine degradation' vs 'within tolerance'). Guard against <5 flights and empty data with a polite empty state. All text in English.
+- Files: `dashboard/pages/4_Combustivel.py`
+- Rationale: Diversification rule blocks 5_FOQA (last 2 runs); 4_Combustivel hasn't been touched and Tier 1 is saturated (90%), so Tier 2 is in scope. This single change lands three Tier 2 backlog items at once — degradation timeline per component, amber/red threshold zones, and per-aircraft drill-down — and directly applies documented lessons: it anchors the signal to each tail's OWN absolute baseline (not the fleet-relative ×1.05 coloring in Section 2 that is statistically guaranteed to trip), requires ≥5 flights before emitting a verdict for robustness, and turns observation into action ('what should I do'). It is pure extension appended after Section 4, isolated and degrading gracefully.
+- Self-eval: alignment=6, value=6, quality=6, risk=2
+
+## 2026-06-05 07:00
+- **[Tier 2]** Add contextual hover tooltips to the 5 SAV degradation trend charts in `_trend_chart`. Pass `custom_data=['ac_sn']` to px.scatter and set a hovertemplate on the marker traces (selector mode='markers') showing: MSN (bold), flight date (%d-%b-%Y), the signal value formatted with its unit, the degradation-direction context (rising/falling is bad), and the computed P90/P10 degradation threshold for that signal. The trendline trace keeps its default hover. No data invented; all strings in English.
+- Files: `dashboard/pages/1_SAV.py`
+- Rationale: Tier 2 is at 20% and must be advanced before Tier 3 (rule 1). The next unaddressed Tier 2 backlog item is 'Tooltips com contexto (limite, MSN, data)'. 1_SAV.py has 9 charts but `has_tooltips=false` and has not been touched in the last 5 runs, satisfying rule 3 (avoid 5_FOQA_MOQA / 4_Combustivel, recently edited). The change embeds the per-point context the operator needs to act (which tail, when, how far into the degradation zone), aligning with product principle #2 'contexto sempre visível' and the lesson that actionable insight beats cosmetic tweaks. It is isolated to one helper function, degrades gracefully, and reuses the already-computed `p_bad` threshold so the tooltip and the visual hrect cannot diverge.
+- Self-eval: alignment=7, value=6, quality=7, risk=2
+
+## 2026-06-05 07:00
+- **[Tier 2]** Rebuild Section 2's 'Alert Rate Heatmap — MSN × Wheel Position' using px.imshow on the existing wide matrix (ac_sn index × position columns) with a fixed color scale (zmin=0, zmax=100) and per-cell annotated values (text_auto='.0f'), replacing the current px.density_heatmap whose Plotly auto-normalization makes a 5% alert-rate cell look as red as a 90% one. Keep the same green→amber→red colorscale, MSN/position labels, dynamic height, and a polite empty state if no positive alert rates exist.
+- Files: `dashboard/pages/2_Rodas_e_Freios.py`
+- Rationale: Diversifies away from the last 3 runs (5_FOQA, 4_Combustivel, 1_SAV) onto a page untouched recently, and directly closes a documented lesson ('Em heatmaps de contagem, fixar zmin/zmax ou anotar valores nas células evita que a normalização automática do Plotly engane a percepção de severidade'). This exact misleading pattern lives in Section 2 of this page: severity is currently relative to the matrix max, so a single-alert tail can read as critically red as a chronically failing one — a real misread risk in a paid safety product. Fixing the scale to absolute 0–100% plus on-cell counts makes severity comparable across aircraft and exact, which is a correctness/triage improvement (which tail to act on first), not gratuitous polish.
+- Self-eval: alignment=8, value=7, quality=8, risk=2
+
+## 2026-06-06 07:00
+- **[Tier 2]** Enhance Section 4 (Dispatch Forecast) into an actionable maintenance-planning triage. Add a sidebar 'Planning horizon (days)' slider (default 30). Reusing the single existing df_fc computation (no recompute/divergence), add an 'Estimated date' column (today + days-to-amber) and render a prioritized triage banner ABOVE the detail table: st.error listing the specific MSNs currently below 845 PSI ('Immediate — no dispatch, QRH action required'), st.warning listing MSNs forecast to cross the 845 PSI amber threshold within the planning horizon with their estimated calendar dates, and st.success when none require action. Only flag aircraft where avg daily drop > 0 (finite forecast); guard empty df_fc. All text in English.
+- Files: `dashboard/pages/3_Oxigenio.py`
+- Rationale: 3_Oxigenio is the only eligible page untouched in the last 5 runs (diversification per rules) and the most mature, so a focused actionable feature lands cleanly. The lessons repeatedly say to prioritize 'what should I do' over status/cosmetics, and that count KPIs have limited value unless they expose the specific entities — this converts the existing forecast table into a triage that names the exact MSNs to act on and when, reusing the same df_fc to avoid KPI/table divergence. Additive and isolated, so no regression risk to existing charts.
+- Self-eval: alignment=7, value=7, quality=6, risk=4
+
+## 2026-06-07 07:00
+- **[Tier 2]** Add a 'Per-Aircraft Exceedance Drill-Down' section immediately after the Fleet Exceedance Heatmap (before the tabs), giving the natural 'see hotspot → drill into that tail' flow. Add an MSN selectbox (options = sorted unique ac_sn from the filtered df; default to the tail with the most exceedances). For the selected MSN, build a chronological event table ONLY from exceedance flag columns already present in df, where each row = date, Parameter (human label), Recorded value (the matching measured column, e.g. max_itt_lh_takeoff for ITT T/O, max_n2_vib_lh/rh for N2 vib, max_normal_accel_landing for hard landing, max_cas_kias for VMO, max_cas_gear_down for VLE, max_apu_egt for APU EGT), AMM limit (reuse the module constants ITT_TAKEOFF_C / N2_VIB_AMBER / VMO_KIAS etc.; for hard landing use the per-row hard_landing_g_limit, for VLE use VLE 265 kias as a local constant), and Recommended action (static AMM-task strings already used elsewhere on the page, e.g. APU 'MPP7166_05-50-55', N2 vib 'borescope per AMM', others a generic 'review ATA 05 task'). Guard each parameter with df.get(...)/column presence and skip entirely-absent ones; sort events most-recent first; show a count + most-recent-date st.metric pair and an st.success polite empty state when the selected tail has zero exceedances. Reuse df_full for the selectbox options is NOT needed here (this is exploratory drill-down, the sidebar filter is acceptable). All text in English; no data invented.
+- Files: `dashboard/pages/5_FOQA_MOQA.py`
+- Rationale: Tier 2 is at 50% and the only un-touched-recently pages are FOQA (Jun-03) and Combustivel (Jun-04); FOQA is the cleaner, lower-risk target because Combustivel's cruise-burn normalization fix depends on duration/distance columns whose existence I cannot confirm without risking invented data. 'Drill-down por aeronave em alerta' is an explicit open Tier-2 backlog item and the heatmap added on Jun-03 creates a hotspot the operator currently cannot click into. This turns observation into action by pairing each event with its AMM limit and a recommended task — satisfying 'Ação > observação' and 'Contexto sempre visível (MSN, data, limite AMM)'. It is purely flag-filtering over existing columns (no fragile statistics, no slider-dependent baselines), avoiding the statistical-fragility traps from the last two runs, and the per-event AMM-limit + action context is not duplicated by the raw Event Log tab.
+- Self-eval: alignment=7, value=6, quality=8, risk=2
+
+## 2026-06-07 07:00
+- **[Tier 2]** Compute the SAV failure alerts over the full unfiltered fleet instead of the sidebar-filtered df. After dtype normalization, build df_lh_full/df_rh_full (drop NaN dates + sort, NO MSN/days_back filter). Change the two '🔴 In alert' KPI cards to count from the full fleet. Add a fleet-wide safety triage banner immediately under the KPI row: st.error naming the specific MSNs whose latest flight predicts pre-failure on LH and/or RH (e.g. 'LH pre-failure predicted: MSN 123, MSN 456 — inspect starter air valve per AMM'), with a caption noting it is fleet-wide and ignores the sidebar filter; st.success when none. Also switch the 'Current Risk Status' tab to use df_lh_full/df_rh_full so no aircraft in alert can be hidden by the cosmetic filter. Trend-chart tabs stay on the filtered df (exploratory). All text in English; no data invented; guard empty/missing columns.
+- Files: `dashboard/pages/1_SAV.py`
+- Rationale: Applies the most-repeated, highest-value lesson across recent runs ('safety/no-dispatch alerts must be computed over the whole fleet, never inherit cosmetic UI filters') to the one safety-critical page that still violates it, plus the 'expose the specific MSNs, not just a count' lesson — turning an aggregate number into a named, actionable triage. The page was not touched in the last 3 runs, the change is isolated and low-risk, and it advances Tier 2's open 'drill-down/alert per aircraft' item without cosmetic polish.
+- Self-eval: alignment=8, value=7, quality=6, risk=3
+
+## 2026-06-08 07:00
+- **[Tier 2]** Normalize Section 5 (Per-Aircraft Cruise-Burn Degradation vs Own Baseline) by cruise duration: replace the absolute _cruise_total (kg) signal with a cruise specific burn rate (kg/h) = _cruise_total / (time_sec_cruise/3600). Build a guarded derived column df['_cruise_kg_per_hr'] (only where time_sec_cruise is present and > 0; drop rows with missing/zero duration for this section). Keep the identical baseline/amber(+5%)/red(+10%) logic, the rect bands, the three hlines, the per-flight marker coloring, the recent-N vs baseline verdict banner and the empty/low-sample/non-positive guards — only swap the metric to the rate and update units/labels (y-axis 'Cruise fuel rate (kg/h)', baseline annotation, banner text 'burning X% above its own cruise burn-rate baseline'). Update the section caption to state the signal is normalized by cruise time so route length no longer confounds engine health. If time_sec_cruise column is entirely absent, fall back to the existing absolute-kg behavior with a caption note. All text in English; no data invented.
+- Files: `dashboard/pages/4_Combustivel.py`
+- Rationale: Section 5 is the only part of the page that names a specific MSN and recommends 'inspect for engine degradation', yet it compares absolute cruise kg — a longer cruise (longer route) burns more fuel regardless of engine health, the exact false-positive trap documented in the lessons ('normalizar a queima por duração ou distância do cruzeiro antes de comparar voos; kg absolutos confundem comprimento de rota com saúde do motor'). The required input (time_sec_cruise) is confirmed present in the dashboard parquet, so this is the highest-integrity, highest-value fix available: it makes a tail-flagging safety/maintenance signal actually trustworthy instead of polishing exploratory charts. The page was not touched in the last 3 runs, satisfying rotation rules.
+- Self-eval: alignment=8, value=8, quality=8, risk=3
