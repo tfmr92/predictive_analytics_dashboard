@@ -75,6 +75,11 @@ for phase_en, phase_label in _PHASE_MAP.items():
 
 cruise_cols = [c for c in burn_cols if "cruise" in c]
 
+# Ensure all fuel columns are numeric (parquet may deserialise them as strings)
+all_burn_cols = list(burn_cols.keys())
+for _c in all_burn_cols:
+    df[_c] = pd.to_numeric(df[_c], errors="coerce")
+
 # Total cruise fuel per flight, computed once and reused across KPIs and sections.
 if cruise_cols:
     df["_cruise_total"] = df[cruise_cols].sum(axis=1)
