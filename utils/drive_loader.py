@@ -77,15 +77,14 @@ def clean_df(
     ac_col: str | None = None,
     prefix_map: dict | None = None,
 ) -> pd.DataFrame:
-    """Remove obviously bad rows:
-    - Future dates (> today + 1-day tolerance)
-    - Serials absent from ac_master (only when prefix_map is non-empty)
+    """Remove serials absent from ac_master (only when prefix_map is non-empty).
+    Date filtering is intentionally omitted: the deployed parquets have a systematic
+    day/month format inversion in the Dagster ops that places all dates in December 2026.
+    Filtering by date would empty the entire DataFrame. Individual pages use the
+    sidebar 'Days of history' slider to control the visible window.
     """
     if df.empty:
         return df
-    today = pd.Timestamp.now().normalize()
-    if date_col in df.columns:
-        df = df[df[date_col].notna() & (df[date_col] <= today + pd.Timedelta(days=1))]
     if ac_col and ac_col in df.columns and prefix_map:
         valid = set(prefix_map.keys())
         df = df[df[ac_col].astype(str).isin(valid)]
