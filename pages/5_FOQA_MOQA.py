@@ -30,6 +30,10 @@ VLE_KIAS           = 265  # gear-extended speed limit (local constant)
 DRILLDOWN_SPECS = [
     ("ITT Takeoff LH (°C)",  'itt_lh_takeoff_exceedance', 'max_itt_lh_takeoff',      ITT_TAKEOFF_C, "review ATA 05 task"),
     ("ITT Takeoff RH (°C)",  'itt_rh_takeoff_exceedance', 'max_itt_rh_takeoff',      ITT_TAKEOFF_C, "review ATA 05 task"),
+    ("ITT Continuous LH (°C)", 'itt_lh_continuous_exceedance', 'max_itt_lh_climb',   ITT_CONTINUOUS_C, "review ATA 05 continuous limit"),
+    ("ITT Continuous RH (°C)", 'itt_rh_continuous_exceedance', 'max_itt_rh_climb',   ITT_CONTINUOUS_C, "review ATA 05 continuous limit"),
+    ("Low Oil Press LH (psig)", 'oil_press_lh_low',        'min_oil_press_lh',        OIL_PRESS_MIN, "check oil system per AMM"),
+    ("Low Oil Press RH (psig)", 'oil_press_rh_low',        'min_oil_press_rh',        OIL_PRESS_MIN, "check oil system per AMM"),
     ("N2 Vibration LH (AU)", 'n2_vib_lh_amber',           'max_n2_vib_lh',           N2_VIB_AMBER,  "borescope per AMM"),
     ("N2 Vibration RH (AU)", 'n2_vib_rh_amber',           'max_n2_vib_rh',           N2_VIB_AMBER,  "borescope per AMM"),
     ("Hard landing (g)",     'hard_landing_flag',         'max_normal_accel_landing', 'HARD_LANDING', "review ATA 05 task"),
@@ -197,6 +201,10 @@ else:
     param_specs = [
         ("ITT T/O", lambda d: d.get('itt_lh_takeoff_exceedance', pd.Series(False, index=d.index)).fillna(False)
                               | d.get('itt_rh_takeoff_exceedance', pd.Series(False, index=d.index)).fillna(False)),
+        ("ITT Cont.", lambda d: d.get('itt_lh_continuous_exceedance', pd.Series(False, index=d.index)).fillna(False)
+                                | d.get('itt_rh_continuous_exceedance', pd.Series(False, index=d.index)).fillna(False)),
+        ("Low oil press", lambda d: d.get('oil_press_lh_low', pd.Series(False, index=d.index)).fillna(False)
+                                    | d.get('oil_press_rh_low', pd.Series(False, index=d.index)).fillna(False)),
         ("N2 vib amber", lambda d: d.get('n2_vib_lh_amber', pd.Series(False, index=d.index)).fillna(False)
                                    | d.get('n2_vib_rh_amber', pd.Series(False, index=d.index)).fillna(False)),
         ("Hard landing", lambda d: d.get('hard_landing_flag', pd.Series(False, index=d.index)).fillna(False)),
@@ -207,6 +215,8 @@ else:
 
     present_flag_cols = {
         'itt_lh_takeoff_exceedance', 'itt_rh_takeoff_exceedance',
+        'itt_lh_continuous_exceedance', 'itt_rh_continuous_exceedance',
+        'oil_press_lh_low', 'oil_press_rh_low',
         'n2_vib_lh_amber', 'n2_vib_rh_amber',
         'hard_landing_flag', 'vmo_exceedance', 'vle_exceedance', 'apu_egt_exceedance',
     } & set(df.columns)

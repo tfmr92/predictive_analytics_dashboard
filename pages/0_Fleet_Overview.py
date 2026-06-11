@@ -16,6 +16,7 @@ st.set_page_config(page_title="Fleet Overview", layout="wide", page_icon="🗺�
 
 PSI_CYAN  = 1155   # Oxygen: Observer Oxy Lo Press — cyan CAS
 PSI_AMBER = 845    # Oxygen: Crew Oxy Lo Press — amber CAS / no dispatch
+FORECAST_HORIZON_DAYS = 30  # fixed planning horizon for upcoming inspections
 
 # ── Load all parquets (each is non-fatal if unavailable) ──────────────────────
 @st.cache_data(ttl=300)
@@ -76,6 +77,99 @@ def _latest(df: pd.DataFrame, ac_col: str) -> pd.DataFrame:
 
 def _dnm(msn) -> str:
     return display_name(str(msn), prefix_map)
+
+
+@st.cache_data(ttl=300)
+def _oxy_maintenance_forecast(df_oxy: pd.DataFrame, ac_col: str, cutoff_ts: pd.Timestamp) -> dict:
+    """Fleet-wide forecast of aircraft projected to cross the 845 PSI amber
+    (no-dispatch) threshold, reusing the oxygen dispatch-forecast method with the
+    documented robustness lessons applied:
+      - recency guard: only flights within the selected history window
+      - minimum sample: require >= 4 in-window readings per aircraft
+      - smoothed current reading: current_psi = median of last 5 PSI values
+      - median daily drop (not mean) from delta_press; skip non-positive drop
+    Returns {"rows": [...within horizon...], "n_evaluated": <int forecastable a/c>}.
+    """
+    if df_oxy is None or df_oxy.empty or not ac_col:
+        return {"rows": [], "n_evaluated": 0}
+    if (ac_col not in df_oxy.columns
+            or "psi" not in df_oxy.columns
+            or "delta_press" not in df_oxy.columns):
+        return {"rows": [], "n_evaluated": 0}
+
+    sub = df_oxy.copy()
+    if "date" in sub.columns:
+        sub = sub[sub["date"] >= cutoff_ts]
+    sub = sub.dropna(subset=["psi", "delta_press", ac_col])
+    if sub.empty:
+        return {"rows": [], "n_evaluated": 0}
+
+    today = pd.Timestamp.now().normalize()
+    rows: list = []
+    n_evaluated = 0
+
+    for msn, grp in sub.groupby(ac_col):
+        grp = grp.sort_values("date") if "date" in grp.columns else grp
+        if len(grp) < 4:                            # minimum sample guard
+            continue
+        current_psi = float(grp["psi"].tail(5).median())   # smoothed current reading
+        daily_drop = float(grp["delta_press"].median())    # median, not mean
+        if daily_drop <= 0:                          # skip non-positive drop
+            continue
+        n_evaluated += 1
+        days_to_amber = (current_psi - PSI_AMBER) / daily_drop
+        if days_to_amber <= 0 or days_to_amber > FORECAST_HORIZON_DAYS:
+            continue
+        rows.append({
+            "msn": str(msn),
+            "current_psi": current_psi,
+            "daily_drop": daily_drop,
+            "days_to_amber": days_to_amber,
+            "est_date": today + pd.Timedelta(days=days_to_amber),
+        })
+
+    rows.sort(key=lambda r: r["days_to_amber"])
+    return {"rows": rows, "n_evaluated": n_evaluated}
+
+
+@st.cache_data(ttl=300)
+def _wnb_alerts(df_wnb: pd.DataFrame, cutoff_ts: pd.Timestamp) -> dict:
+    """Wheels & Brakes (ATA 32) removal alerts from the LONG-format W&B report.
+
+    The W&B report carries one row per (aircraft, brake/gear position) — up to 6
+    positions per tail — so collapsing with _latest would drop 5 of 6 positions.
+    Instead this takes the latest record per (aircraft, position), then OR-aggregates
+    the binary prediction columns across positions: a tail is flagged if ANY position
+    predicts a removal. Returns {msn: 1|0}; empty dict if no data / no prediction cols.
+    """
+    if df_wnb is None or df_wnb.empty:
+        return {}
+    ac_col = next((c for c in ("ac_sn", "aircraftSerNum-1") if c in df_wnb.columns), None)
+    if ac_col is None or "position" not in df_wnb.columns:
+        return {}
+    pred_cols = [c for c in df_wnb.columns if c.startswith("prediction_")]
+    if not pred_cols:
+        return {}
+
+    sub = df_wnb[df_wnb["date"] >= cutoff_ts] if "date" in df_wnb.columns else df_wnb
+    if sub.empty:
+        return {}
+
+    latest = (
+        sub.sort_values("date").groupby([ac_col, "position"]).last()
+        if "date" in sub.columns
+        else sub.groupby([ac_col, "position"]).last()
+    )
+    # NaN-skipping max == OR across positions
+    agg = latest.reset_index().groupby(ac_col)[pred_cols].max()
+
+    wnb_alert: dict = {}
+    for msn, row in agg.iterrows():
+        row_max = row.max()  # NaN if all positions/cols are NaN
+        if pd.isna(row_max):
+            continue
+        wnb_alert[str(msn)] = 1 if float(row_max) == 1 else 0
+    return wnb_alert
 
 
 # ── Build per-system alert snapshots ─────────────────────────────────────────
@@ -148,25 +242,41 @@ for fleet_key, fleet_label in [("a320", "A320"), ("a330", "A330")]:
         for tail, n in counts.items():
             airbus_alerts[f"{fleet_label}:{tail}"] = int(n)
 
+# Wheels & Brakes (ATA 32) — long-format OR aggregation across all 6 positions
+wnb_alert = _wnb_alerts(data["wnb"], cutoff)
+
 # ── Collect all aircraft ──────────────────────────────────────────────────────
 all_e2 = sorted(set(
     list(sav_lh_alert.keys())
     + list(sav_rh_alert.keys())
     + list(oxy_alert.keys())
     + list(foqa_exceedances.keys())
+    + list(wnb_alert.keys())
 ))
+
+# ── Predictive catches (commercial KPI) ───────────────────────────────────────
+# Distinct-aircraft sets of critical predictive catches across the full fleet.
+# Each catch is a potential unscheduled removal / AOG flagged before failure.
+sav_catch_msns = {
+    msn for msn in all_e2
+    if sav_lh_alert.get(msn) == 1 or sav_rh_alert.get(msn) == 1
+}
+oxy_nodispatch_msns = {msn for msn, v in oxy_alert.items() if v == 2}
+wnb_catch_msns = {msn for msn, v in wnb_alert.items() if v == 1}
+airbus_catch = {key for key, n in airbus_alerts.items() if n > 5}
+predictive_catches = len(sav_catch_msns | oxy_nodispatch_msns | wnb_catch_msns) + len(airbus_catch)
 
 # ── KPI row ───────────────────────────────────────────────────────────────────
 st.title("🗺️ Fleet Overview")
 st.caption(f"Multi-fleet predictive maintenance · {date.today().strftime('%d-%b-%Y')} · {days_back}-day window")
 
-n_sav_alert = sum(1 for v in {**sav_lh_alert, **sav_rh_alert}.values() if v == 1)
+n_sav_alert = len(sav_catch_msns)
 n_oxy_red   = sum(1 for v in oxy_alert.values() if v == 2)
 n_oxy_amber = sum(1 for v in oxy_alert.values() if v == 1)
 n_foqa      = sum(1 for v in foqa_exceedances.values() if v > 0)
 n_airbus    = sum(1 for v in airbus_alerts.values() if v > 0)
 
-c1, c2, c3, c4, c5 = st.columns(5)
+c1, c2, c3, c4, c5, c6 = st.columns(6)
 c1.metric("✈️ E2 aircraft tracked", len(all_e2))
 c2.metric("🔴 SAV alerts (LH+RH)", n_sav_alert,
           help="Aircraft with predicted pre-failure on starter valve (latest flight)")
@@ -176,6 +286,17 @@ c4.metric("🔍 E2 FOQA exceedances", n_foqa,
           help=f"Aircraft with ≥1 engine/aircraft exceedance in last {days_back} days")
 c5.metric("🛫 Airbus FOQA alerts", n_airbus,
           help=f"A320/A330 aircraft with exceedances in last {days_back} days")
+c6.metric("🛡️ Unsched. removals flagged", predictive_catches,
+          help="Distinct aircraft flagged with a critical predictive catch this period "
+               "(E2 SAV LH/RH pre-failure, oxygen no-dispatch, or W&B brake/gear removal, "
+               "plus Airbus red-tier >5 exceedances). Each is a potential unscheduled "
+               "removal / AOG caught before failure — a candidate save, not an asserted one.")
+
+st.caption(
+    "🛡️ **Commercial impact** — each flagged aircraft is a potential unscheduled "
+    "removal or AOG caught predictively before in-service failure this period. "
+    "Specific tails are listed in the Immediate Actions banner below."
+)
 
 st.divider()
 
@@ -190,6 +311,8 @@ for msn in all_e2:
     if oxy_alert.get(msn) == 2:
         psi = oxy_psi.get(msn, 0)
         immediate_items.append(f"**{_dnm(msn)}** — Oxygen: {psi:.0f} PSI < {PSI_AMBER} PSI — no dispatch, QRH action required (ATA 35)")
+    if wnb_alert.get(msn) == 1:
+        immediate_items.append(f"**{_dnm(msn)}** — W&B: predicted brake/gear removal (inspect landing gear ATA 32)")
 
 for key, n in airbus_alerts.items():
     if n > 0:
@@ -214,6 +337,58 @@ if watch_items:
 
 if not immediate_items and not watch_items:
     st.success(f"✅ No critical alerts in the last {days_back} days across all monitored systems.")
+
+# ── Upcoming Maintenance Forecast (Tier 3 — upcoming inspections) ─────────────
+st.subheader("📅 Oxygen Servicing Forecast")
+st.caption(
+    f"Forward-looking oxygen servicing calendar. Projects each E2 aircraft's "
+    f"days-to-amber from the median daily PSI drop (PSI/day) and the smoothed current pressure "
+    f"(median of the last 5 readings) within the {days_back}-day window, and flags "
+    f"those forecast to cross the {PSI_AMBER} PSI amber (no-dispatch) threshold inside "
+    f"a {FORECAST_HORIZON_DAYS}-day planning horizon."
+)
+
+_oxy_df = data["oxy"]
+_oxy_cols_ok = (
+    oxy_ac_col is not None
+    and not _oxy_df.empty
+    and "psi" in _oxy_df.columns
+    and "delta_press" in _oxy_df.columns
+)
+
+if not _oxy_cols_ok:
+    st.info(
+        "Oxygen-pressure history is unavailable (no PSI / daily-drop columns in the "
+        "current window) — upcoming-maintenance forecast cannot be computed."
+    )
+else:
+    _fc = _oxy_maintenance_forecast(_oxy_df, oxy_ac_col, cutoff)
+    _fc_rows = _fc["rows"]
+    if _fc_rows:
+        _lines = [
+            f"- **{_dnm(r['msn'])}** → est. servicing {r['est_date'].strftime('%d-%b-%Y')} "
+            f"({int(r['days_to_amber'])} days remaining) · PSI path "
+            f"{r['current_psi']:.0f} → {PSI_AMBER} at {r['daily_drop']:.1f} PSI/day · "
+            f"plan ATA 35 oxygen cylinder servicing"
+            for r in _fc_rows
+        ]
+        st.warning(
+            f"**📅 Plan oxygen servicing within {FORECAST_HORIZON_DAYS} days** — the "
+            f"following aircraft are forecast to cross the {PSI_AMBER} PSI amber "
+            f"(no-dispatch) threshold:\n" + "\n".join(_lines)
+        )
+    elif _fc["n_evaluated"] > 0:
+        st.success(
+            f"✅ No E2 aircraft forecast to cross the {PSI_AMBER} PSI amber threshold "
+            f"within the next {FORECAST_HORIZON_DAYS} days "
+            f"({_fc['n_evaluated']} aircraft evaluated)."
+        )
+    else:
+        st.info(
+            f"Insufficient oxygen-pressure history in the last {days_back} days to forecast "
+            f"upcoming servicing (need ≥ 4 readings per aircraft with a positive daily drop). "
+            f"Expand the history window in the sidebar."
+        )
 
 st.divider()
 
@@ -240,9 +415,11 @@ if "E2" in fleet_filter and all_e2:
         # FOQA
         foqa_n = foqa_exceedances.get(msn, None)
         foqa_cell = ("🔴" if foqa_n and foqa_n > 0 else ("🟢" if foqa_n == 0 else "—"))
+        # Wheels & Brakes (ATA 32)
+        wnb_cell = "🔴" if wnb_alert.get(msn) == 1 else ("🟢" if msn in wnb_alert else "—")
 
         # Overall worst
-        cells = [sav_lh_cell, sav_rh_cell, oxy_cell, foqa_cell]
+        cells = [sav_lh_cell, sav_rh_cell, oxy_cell, foqa_cell, wnb_cell]
         if "🔴" in cells:
             worst = "🔴 Critical"
         elif "🟡" in cells:
@@ -260,6 +437,7 @@ if "E2" in fleet_filter and all_e2:
             "SAV RH": sav_rh_cell,
             "Oxygen": f"{oxy_cell} {psi_val} PSI".strip(),
             "FOQA": f"{foqa_cell} ({foqa_n})" if foqa_n is not None else foqa_cell,
+            "W&B": wnb_cell,
         })
 
     if matrix_rows:
@@ -276,7 +454,7 @@ if "E2" in fleet_filter and all_e2:
                 return ["background-color: rgba(245,158,11,0.10)"] * len(row)
             return [""] * len(row)
 
-        display_cols = ["Aircraft", "Overall", "SAV LH", "SAV RH", "Oxygen", "FOQA"]
+        display_cols = ["Aircraft", "Overall", "SAV LH", "SAV RH", "Oxygen", "FOQA", "W&B"]
         st.dataframe(
             df_matrix[display_cols].style.apply(_color_matrix, axis=1),
             use_container_width=True,
