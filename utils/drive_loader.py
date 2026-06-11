@@ -24,13 +24,15 @@ def _get_service():
 
 @st.cache_data(ttl=3600, show_spinner="Atualizando dados...")
 def load(filename: str) -> pd.DataFrame:
-    """Baixa *filename* da pasta Drive configurada e retorna DataFrame."""
+    """Baixa *filename* da pasta Drive configurada e retorna DataFrame.
+    Quando há nomes duplicados, usa o modificado mais recentemente."""
     folder_id = st.secrets["GOOGLE_DRIVE_FOLDER_ID"]
     service = _get_service()
 
     results = service.files().list(
         q=f"name='{filename}' and '{folder_id}' in parents and trashed=false",
-        fields="files(id, name)",
+        fields="files(id, name, modifiedTime)",
+        orderBy="modifiedTime desc",
     ).execute()
 
     files = results.get("files", [])
@@ -46,7 +48,11 @@ def load(filename: str) -> pd.DataFrame:
         _, done = downloader.next_chunk()
 
     buf.seek(0)
-    return pd.read_parquet(buf)
+    try:
+        return pd.read_parquet(buf)
+    except Exception as exc:
+        st.warning(f"Falha ao ler **{filename}**: {exc}")
+        return pd.DataFrame()
 
 
 @st.cache_data(ttl=3600, show_spinner=False)

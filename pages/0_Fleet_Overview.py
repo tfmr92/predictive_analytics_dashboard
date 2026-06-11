@@ -20,34 +20,44 @@ FORECAST_HORIZON_DAYS = 30  # fixed planning horizon for upcoming inspections
 
 # ── Load all parquets (each is non-fatal if unavailable) ──────────────────────
 @st.cache_data(ttl=300)
-def _load_all() -> dict:
-    datasets = {}
+def _load_all() -> tuple[dict, dict]:
+    datasets, errors = {}, {}
     for key, filename in {
-        "sav_lh":  "e2_sav_lh_report.parquet",
-        "sav_rh":  "e2_sav_rh_report.parquet",
-        "oxy":     "e2_oxy_report.parquet",
-        "foqa":    "e2_foqa_report.parquet",
-        "wnb":     "e2_wnb_report.parquet",
-        "fuel":    "e2_fuel_report.parquet",
-        "a320":    "airbus_a320_foqa_report.parquet",
-        "a330":    "airbus_a330_foqa_report.parquet",
+        "sav_lh":      "e2_sav_lh_report.parquet",
+        "sav_rh":      "e2_sav_rh_report.parquet",
+        "oxy":         "e2_oxy_report.parquet",
+        "foqa":        "e2_foqa_report.parquet",
+        "wnb":         "e2_wnb_report.parquet",
+        "fuel":        "e2_fuel_report.parquet",
+        "a320":        "airbus_a320_foqa_report.parquet",
+        "a330":        "airbus_a330_foqa_report.parquet",
+        "sav_a320_e1": "airbus_sav_eng1_report.parquet",
+        "sav_a320_e2": "airbus_sav_eng2_report.parquet",
     }.items():
         try:
             df = load(filename)
-            # Airbus FOQA parquets carry 'flight_datetime' (YYYYMMDDHHMMSS) instead of 'date'
+            # Some parquets carry 'flight_datetime' instead of 'date'
+            # (Airbus FOQA: compact string YYYYMMDDHHMMSS; Airbus SAV: datetime64)
             if "date" not in df.columns and "flight_datetime" in df.columns:
-                df["date"] = pd.to_datetime(
-                    df["flight_datetime"].astype(str), format="%Y%m%d%H%M%S", errors="coerce"
-                )
+                if pd.api.types.is_datetime64_any_dtype(df["flight_datetime"]):
+                    df["date"] = df["flight_datetime"]
+                else:
+                    df["date"] = pd.to_datetime(
+                        df["flight_datetime"].astype(str), format="%Y%m%d%H%M%S",
+                        errors="coerce",
+                    )
             if "date" in df.columns:
                 df["date"] = pd.to_datetime(df["date"], errors="coerce")
             datasets[key] = df
-        except Exception:
+            if df.empty:
+                errors[key] = "loaded 0 rows (file missing on Drive or unreadable)"
+        except Exception as exc:
             datasets[key] = pd.DataFrame()
-    return datasets
+            errors[key] = f"{type(exc).__name__}: {exc}"
+    return datasets, errors
 
 
-data = _load_all()
+data, data_errors = _load_all()
 prefix_map = make_prefix_map()
 
 # Filter future dates and invalid serials from all E2 datasets
@@ -255,6 +265,17 @@ for fleet_key, fleet_label in [("a320", "A320"), ("a330", "A330")]:
 # Wheels & Brakes (ATA 32) — long-format OR aggregation across all 6 positions
 wnb_alert = _wnb_alerts(data["wnb"], cutoff)
 
+# SAV A320 — latest-start pre-failure prediction per engine
+sav_a320_alerts: dict = {}   # {tail: [eng_labels]}
+for _key, _eng in [("sav_a320_e1", "Eng 1"), ("sav_a320_e2", "Eng 2")]:
+    _df_sa = data.get(_key, pd.DataFrame())
+    if _df_sa.empty or "sav_failure_pred" not in _df_sa.columns or "aircraft_id" not in _df_sa.columns:
+        continue
+    _df_sa = _df_sa[_df_sa["aircraft_id"].astype(str).str.strip() != ""]
+    _lat = _df_sa.sort_values("date").groupby("aircraft_id").last()
+    for tail in _lat.index[_lat["sav_failure_pred"].eq(1)]:
+        sav_a320_alerts.setdefault(str(tail), []).append(_eng)
+
 # ── Collect all aircraft ──────────────────────────────────────────────────────
 all_e2 = sorted(set(
     list(sav_lh_alert.keys())
@@ -328,6 +349,12 @@ for key, n in airbus_alerts.items():
     if n > 0:
         fleet, tail = key.split(":", 1)
         immediate_items.append(f"**{fleet} {tail}** — FOQA: {n} exceedance(s) in last {days_back} days")
+
+for tail, engs in sorted(sav_a320_alerts.items()):
+    immediate_items.append(
+        f"**A320 {tail}** — SAV {' + '.join(engs)}: predicted pre-failure "
+        "(inspect starter air valve ATA 80)"
+    )
 
 if immediate_items:
     st.error("**🚨 Immediate Actions Required**\n\n" + "\n\n".join(f"- {x}" for x in immediate_items))
@@ -529,22 +556,29 @@ for fleet_key, fleet_label in [("a320", "A320"), ("a330", "A330")]:
 # ── Data freshness ────────────────────────────────────────────────────────────
 st.divider()
 with st.expander("Data freshness — last update per system"):
-    for label, df_key, ac_col_name in [
-        ("SAV LH", "sav_lh", "ac_sn"),
-        ("SAV RH", "sav_rh", "ac_sn"),
-        ("Oxygen", "oxy", oxy_ac_col),
-        ("FOQA E2", "foqa", "ac_sn"),
-        ("A320 FOQA", "a320", airbus_ac_col),
-        ("A330 FOQA", "a330", airbus_ac_col),
+    for label, df_key in [
+        ("SAV LH (E2)", "sav_lh"),
+        ("SAV RH (E2)", "sav_rh"),
+        ("SAV A320 — Eng 1", "sav_a320_e1"),
+        ("SAV A320 — Eng 2", "sav_a320_e2"),
+        ("Oxygen (E2)", "oxy"),
+        ("FOQA E2", "foqa"),
+        ("A320 FOQA", "a320"),
+        ("A330 FOQA", "a330"),
+        ("Wheels & Brakes (E2)", "wnb"),
+        ("Fuel (E2)", "fuel"),
     ]:
-        df_chk = data[df_key]
+        df_chk = data.get(df_key, pd.DataFrame())
         if df_chk.empty or "date" not in df_chk.columns:
-            st.write(f"- **{label}**: no data")
+            reason = data_errors.get(df_key, "no rows after serial/date cleaning")
+            st.write(f"- **{label}**: ❌ no data — {reason}")
             continue
         latest_dt = df_chk["date"].max()
         age = (pd.Timestamp.now() - latest_dt).days if pd.notna(latest_dt) else None
         status = f"✅" if age is not None and age <= 2 else "⚠️"
         st.write(
-            f"- **{label}**: {status} last record {latest_dt.strftime('%d-%b-%Y') if pd.notna(latest_dt) else '—'}"
+            f"- **{label}**: {status} last record "
+            f"{latest_dt.strftime('%d-%b-%Y') if pd.notna(latest_dt) else '—'}"
             + (f" ({age}d ago)" if age is not None else "")
+            + f" · {len(df_chk):,} rows"
         )
