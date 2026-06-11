@@ -34,6 +34,11 @@ def _load_all() -> dict:
     }.items():
         try:
             df = load(filename)
+            # Airbus FOQA parquets carry 'flight_datetime' (YYYYMMDDHHMMSS) instead of 'date'
+            if "date" not in df.columns and "flight_datetime" in df.columns:
+                df["date"] = pd.to_datetime(
+                    df["flight_datetime"].astype(str), format="%Y%m%d%H%M%S", errors="coerce"
+                )
             if "date" in df.columns:
                 df["date"] = pd.to_datetime(df["date"], errors="coerce")
             datasets[key] = df
@@ -225,12 +230,17 @@ if foqa_ac_col and not data["foqa"].empty:
         )
 
 # FOQA Airbus
-airbus_ac_col = "tail_number" if "tail_number" in data["a320"].columns else "ac_sn" if "ac_sn" in data["a320"].columns else None
+def _airbus_col(df: pd.DataFrame) -> str | None:
+    return next((c for c in ("tail_number", "ac_sn") if c in df.columns), None)
+
+airbus_ac_col = _airbus_col(data["a320"]) or _airbus_col(data["a330"])
 airbus_alerts: dict = {}
 for fleet_key, fleet_label in [("a320", "A320"), ("a330", "A330")]:
     df_ab = data[fleet_key]
-    if df_ab.empty or airbus_ac_col is None or airbus_ac_col not in df_ab.columns:
+    _ab_col = _airbus_col(df_ab)
+    if df_ab.empty or _ab_col is None:
         continue
+    airbus_ac_col = _ab_col
     ab_sub = df_ab[df_ab["date"] >= cutoff] if "date" in df_ab.columns else df_ab
     exc_cols = [c for c in ab_sub.columns if c.endswith("_exceedance") or c.endswith("_flag")]
     if exc_cols:
@@ -490,6 +500,10 @@ for fleet_key, fleet_label in [("a320", "A320"), ("a330", "A330")]:
         .rename(columns={ab_col: "Aircraft", "_total": "Exceedances"})
         .sort_values("Exceedances", ascending=False)
     )
+    _n_total_ab = len(ab_counts)
+    ab_counts = ab_counts.head(10)
+    if _n_total_ab > 10:
+        st.caption(f"Showing top 10 of {_n_total_ab} aircraft by exceedance count.")
     ab_counts["Display"] = ab_counts["Aircraft"].apply(
         lambda t: display_name(str(t), prefix_map)
     )

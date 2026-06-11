@@ -381,24 +381,31 @@ for tab_l, acol, impact_col, label in [
         )
         st.plotly_chart(fig_time, use_container_width=True)
 
-        # Per-MSN inspection event count
+        # Per-MSN inspection event count — top 10 aircraft by total events
         if "ac_sn" in df_land.columns:
             insp_counts = (
                 df_land[df_land["Severity"] != "Normal"]
                 .groupby(["ac_sn", "Severity"])
                 .size()
                 .reset_index(name="Count")
-                .sort_values("Count", ascending=False)
             )
             if not insp_counts.empty:
+                totals = insp_counts.groupby("ac_sn")["Count"].sum().sort_values(ascending=False)
+                top_msns = totals.head(10).index.tolist()
+                if len(totals) > 10:
+                    st.caption(f"Top 10 of {len(totals)} aircraft with hard/severe events.")
+                insp_top = insp_counts[insp_counts["ac_sn"].isin(top_msns)].copy()
+                insp_top["Aircraft"] = insp_top["ac_sn"].map(
+                    lambda m: display_name(m, _prefix_map)
+                )
                 fig_bar = px.bar(
-                    insp_counts, x="ac_sn", y="Count",
+                    insp_top, x="Aircraft", y="Count",
                     color="Severity",
                     color_discrete_map=color_map,
-                    labels={"ac_sn": "MSN"},
-                    title=f"Hard/Severe landing events per aircraft — {label}",
+                    category_orders={"Aircraft": [display_name(m, _prefix_map) for m in top_msns]},
+                    title=f"Hard/Severe landing events per aircraft — {label} (top 10)",
                 )
-                fig_bar.update_layout(height=280, legend_title_text="")
+                fig_bar.update_layout(height=300, legend_title_text="")
                 st.plotly_chart(fig_bar, use_container_width=True)
 
         # AMM action card for events requiring inspection
@@ -438,13 +445,18 @@ with tab_bounce:
             "and indicates poor approach energy management. Persistently high values warrant "
             "crew feedback and tire inspection."
         )
-        df_bounce = df.dropna(subset=bounce_cols + ["date"]).copy()
+        df_bounce = df.dropna(subset=["date"]).copy()
 
         for bcol, side in [("bouncing_count_lh", "LH"), ("bouncing_count_rh", "RH")]:
             if bcol not in df_bounce.columns:
                 continue
+            df_side = df_bounce.dropna(subset=[bcol])
+            # lowess trendline needs a handful of points; px crashes (IndexError) on zero traces
+            if len(df_side) < 5:
+                st.info(f"Not enough bounce-count data for {side} in the selected window.")
+                continue
             fig_b = px.scatter(
-                df_bounce, x="date", y=bcol,
+                df_side, x="date", y=bcol,
                 color="ac_sn",
                 trendline="lowess",
                 trendline_scope="overall",
@@ -453,7 +465,7 @@ with tab_bounce:
                 labels={bcol: f"Bounce Count ({side})", "date": "", "ac_sn": "MSN"},
                 title=f"Bounce Count Over Time — {side}",
             )
-            _b_alert = df_bounce[bcol].mean() + df_bounce[bcol].std()
+            _b_alert = df_side[bcol].mean() + df_side[bcol].std()
             fig_b.add_hline(
                 y=_b_alert, line_dash="dot", line_color="orange",
                 annotation_text="Fleet alert level (mean + 1σ)",

@@ -1,6 +1,13 @@
 """
 SAV — Starter Air Valve health monitoring
 Displays the 5 key degradation signals per engine side (LH / RH).
+
+Pre-failure threshold methodology (EDA, see "Threshold Analysis" tab):
+for each degradation signal the population is split by the model's
+pre-failure prediction and the two distributions are compared. A signal
+supports the pre-failure call when the alert-class median sits beyond the
+normal-class P75/P90. The same percentile bands drive the red "degradation
+zone" shading on the trend charts.
 """
 
 import pandas as pd
@@ -8,7 +15,7 @@ import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
 
-from utils.drive_loader import load, clean_df, make_prefix_map
+from utils.drive_loader import load, clean_df, make_prefix_map, display_name
 
 st.set_page_config(page_title="SAV — Starter Air Valve", layout="wide")
 
@@ -42,6 +49,9 @@ _prefix_map = make_prefix_map()
 df_lh = clean_df(df_lh, date_col="date", ac_col="ac_sn", prefix_map=_prefix_map)
 df_rh = clean_df(df_rh, date_col="date", ac_col="ac_sn", prefix_map=_prefix_map)
 
+def _dnm(msn) -> str:
+    return display_name(str(msn), _prefix_map)
+
 # ── Full unfiltered fleet (safety alerts must never inherit the sidebar filter) ──
 def _full_fleet(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty or "date" not in df.columns:
@@ -50,6 +60,17 @@ def _full_fleet(df: pd.DataFrame) -> pd.DataFrame:
 
 df_lh_full = _full_fleet(df_lh)
 df_rh_full = _full_fleet(df_rh)
+
+# ── Alert history: aircraft that have EVER been in predicted pre-failure ──────
+def _alert_history(df: pd.DataFrame, pred_col: str) -> set:
+    if df.empty or pred_col not in df.columns or "ac_sn" not in df.columns:
+        return set()
+    flagged = df.loc[df[pred_col].eq(1), "ac_sn"].astype(str)
+    return set(flagged.unique())
+
+ALERT_HISTORY_LH = _alert_history(df_lh_full, "pre_lh_sav_failure_prediction")
+ALERT_HISTORY_RH = _alert_history(df_rh_full, "pre_rh_sav_failure_prediction")
+ALERT_HISTORY_ANY = ALERT_HISTORY_LH | ALERT_HISTORY_RH
 
 # ── Data freshness ──────────────────────────────────────────────────────────────
 def _latest_flight_date(*dfs: pd.DataFrame) -> pd.Timestamp | None:
@@ -69,11 +90,24 @@ if _latest_date is not None:
 with st.sidebar:
     st.header("Filters")
     days_back = st.slider("Days of history", 30, 365, 120)
+    only_alert = st.checkbox(
+        f"Only aircraft with pre-failure history ({len(ALERT_HISTORY_ANY)})",
+        value=False,
+        help="Restrict every chart to aircraft that have at least one flight "
+             "with a predicted SAV pre-failure (LH or RH) in the loaded history.",
+    )
     all_ac = sorted(
         set(df_lh["ac_sn"].dropna().unique().tolist() if "ac_sn" in df_lh.columns else [])
         | set(df_rh["ac_sn"].dropna().unique().tolist() if "ac_sn" in df_rh.columns else [])
     )
-    selected_ac = st.multiselect("Aircraft (MSN)", options=all_ac, default=all_ac)
+    if only_alert:
+        all_ac = [m for m in all_ac if m in ALERT_HISTORY_ANY]
+    selected_ac = st.multiselect(
+        "Aircraft",
+        options=all_ac,
+        default=all_ac,
+        format_func=_dnm,
+    )
 
 cutoff = pd.Timestamp.now() - pd.Timedelta(days=days_back)
 
@@ -115,13 +149,13 @@ if _lh_alert_msns or _rh_alert_msns:
     if _lh_alert_msns:
         lines.append(
             "**LH pre-failure predicted:** "
-            + ", ".join(f"MSN {m}" for m in _lh_alert_msns)
+            + ", ".join(_dnm(m) for m in _lh_alert_msns)
             + " — inspect starter air valve per AMM"
         )
     if _rh_alert_msns:
         lines.append(
             "**RH pre-failure predicted:** "
-            + ", ".join(f"MSN {m}" for m in _rh_alert_msns)
+            + ", ".join(_dnm(m) for m in _rh_alert_msns)
             + " — inspect starter air valve per AMM"
         )
     st.error("🚨 Fleet safety triage\n\n" + "\n\n".join(lines))
@@ -175,17 +209,34 @@ def _resolve_col(df: pd.DataFrame, col: str) -> str | None:
     return None
 
 
-def _trend_chart(df: pd.DataFrame, col: str, title: str, unit: str, bad_dir: str) -> go.Figure:
+_FLEET_GREY = "#cbd5e1"
+_FLEET_LABEL = "Fleet — no alert history"
+
+
+def _trend_chart(df: pd.DataFrame, col: str, title: str, unit: str, bad_dir: str,
+                 alert_set: set) -> go.Figure | None:
+    """Scatter trend where aircraft with pre-failure history keep an individual
+    color and the rest of the fleet is collapsed into a single grey series."""
     df_plot = df.dropna(subset=[col]).copy()
-    if df_plot.empty:
+    if len(df_plot) < 5:
         return None
+
+    df_plot["_legend"] = df_plot["ac_sn"].map(
+        lambda m: f"⚠ {_dnm(m)}" if m in alert_set else _FLEET_LABEL
+    )
+    alert_labels = sorted(l for l in df_plot["_legend"].unique() if l != _FLEET_LABEL)
+    palette = px.colors.qualitative.Set1
+    color_map = {_FLEET_LABEL: _FLEET_GREY}
+    color_map.update({l: palette[i % len(palette)] for i, l in enumerate(alert_labels)})
 
     fig = px.scatter(
         df_plot,
         x="date", y=col,
-        color="ac_sn",
+        color="_legend",
+        color_discrete_map=color_map,
+        category_orders={"_legend": [_FLEET_LABEL] + alert_labels},
         custom_data=["ac_sn"],
-        labels={col: f"{title} ({unit})", "date": "", "ac_sn": "MSN"},
+        labels={col: f"{title} ({unit})", "date": "", "_legend": "Aircraft"},
         title=title,
         opacity=0.55,
         trendline="lowess",
@@ -219,25 +270,87 @@ def _trend_chart(df: pd.DataFrame, col: str, title: str, unit: str, bad_dir: str
         hovertemplate=hover_template,
     )
     fig.update_layout(
-        height=300,
+        height=320,
         margin=dict(t=40, b=20, l=10, r=10),
         xaxis=dict(tickformat="%d-%b-%y"),
-        legend_title_text="MSN",
+        legend_title_text="Aircraft (⚠ = pre-failure history)",
     )
     return fig
 
 
-# ── Tabs LH / RH ──────────────────────────────────────────────────────────────
-tab_lh, tab_rh, tab_status = st.tabs(["Engine 1 — LH", "Engine 2 — RH", "Current Risk Status"])
+# ── Threshold Analysis (EDA) helpers ──────────────────────────────────────────
+def _signal_eda(df_full: pd.DataFrame, col: str, pred_col: str) -> dict | None:
+    """Compare a signal's distribution between normal and predicted pre-failure
+    flights. Returns the stats used in the histogram + summary table."""
+    if df_full.empty or col not in df_full.columns or pred_col not in df_full.columns:
+        return None
+    sub = df_full.dropna(subset=[col, pred_col])
+    normal = sub.loc[sub[pred_col].eq(0), col].astype(float)
+    alert = sub.loc[sub[pred_col].eq(1), col].astype(float)
+    if len(normal) < 30 or len(alert) < 10:
+        return None
+    return {
+        "normal": normal,
+        "alert": alert,
+        "median_normal": float(normal.median()),
+        "median_alert": float(alert.median()),
+        "p75_normal": float(normal.quantile(0.75)),
+        "p90_normal": float(normal.quantile(0.90)),
+        "p10_normal": float(normal.quantile(0.10)),
+        "p25_normal": float(normal.quantile(0.25)),
+    }
 
-for tab, df, pred_col, side_label, col_idx in [
-    (tab_lh, df_lh, "pre_lh_sav_failure_prediction", "LH", 0),
-    (tab_rh, df_rh, "pre_rh_sav_failure_prediction", "RH", 1),
+
+def _eda_histogram(stats: dict, title: str, unit: str, bad_dir: str) -> go.Figure:
+    fig = go.Figure()
+    fig.add_trace(go.Histogram(
+        x=stats["normal"], name="Normal flights",
+        marker_color="#22c55e", opacity=0.55, histnorm="probability density",
+    ))
+    fig.add_trace(go.Histogram(
+        x=stats["alert"], name="Predicted pre-failure",
+        marker_color="#ef4444", opacity=0.55, histnorm="probability density",
+    ))
+    fig.add_vline(x=stats["median_normal"], line_dash="dash", line_color="#16a34a",
+                  annotation_text="median (normal)", annotation_position="top left")
+    fig.add_vline(x=stats["median_alert"], line_dash="dash", line_color="#dc2626",
+                  annotation_text="median (pre-failure)", annotation_position="top right")
+    ref = stats["p90_normal"] if bad_dir == "up" else stats["p10_normal"]
+    ref_label = "P90 normal" if bad_dir == "up" else "P10 normal"
+    fig.add_vline(x=ref, line_dash="dot", line_color="#f59e0b",
+                  annotation_text=ref_label, annotation_position="bottom right")
+    fig.update_layout(
+        barmode="overlay",
+        title=title,
+        xaxis_title=unit,
+        yaxis_title="density",
+        height=300,
+        margin=dict(t=40, b=30, l=10, r=10),
+        legend=dict(orientation="h", y=1.12),
+    )
+    return fig
+
+
+# ── Tabs LH / RH / Risk / EDA ─────────────────────────────────────────────────
+tab_lh, tab_rh, tab_status, tab_eda = st.tabs(
+    ["Engine 1 — LH", "Engine 2 — RH", "Current Risk Status", "Threshold Analysis (EDA)"]
+)
+
+for tab, df, pred_col, side_label, col_idx, alert_set in [
+    (tab_lh, df_lh, "pre_lh_sav_failure_prediction", "LH", 0, ALERT_HISTORY_LH),
+    (tab_rh, df_rh, "pre_rh_sav_failure_prediction", "RH", 1, ALERT_HISTORY_RH),
 ]:
     with tab:
         if df.empty:
             st.info(f"No data available for {side_label}.")
             continue
+
+        if alert_set:
+            st.caption(
+                "⚠ Aircraft with pre-failure history are individually colored; "
+                "the rest of the fleet is shown in grey: "
+                + ", ".join(_dnm(m) for m in sorted(alert_set))
+            )
 
         rendered = 0
         for signal_name, (lh_col, rh_col, unit, caption, bad_dir) in SIGNALS.items():
@@ -246,7 +359,7 @@ for tab, df, pred_col, side_label, col_idx in [
             if col is None:
                 continue
 
-            fig = _trend_chart(df, col, f"{signal_name} — {side_label}", unit, bad_dir)
+            fig = _trend_chart(df, col, f"{signal_name} — {side_label}", unit, bad_dir, alert_set)
             if fig is None:
                 continue
 
@@ -298,11 +411,21 @@ with tab_status:
                 .reset_index()
                 .sort_values(pred_col, ascending=False)
             )
+            n_total = len(latest)
+            n_alert = int(latest[pred_col].eq(1).sum())
+            # Top 10: every alert aircraft first, fill remaining slots with normals
+            latest = latest.head(max(10, n_alert))
+            if n_total > len(latest):
+                st.caption(
+                    f"Top {len(latest)} of {n_total} aircraft (all {n_alert} in alert shown; "
+                    f"{n_total - len(latest)} normal aircraft hidden)."
+                )
             latest["Status"] = latest[pred_col].map({0: "Normal", 1: "Alert"})
             latest["color"] = latest[pred_col].map({0: "#22c55e", 1: "#ef4444"})
+            latest["Display"] = latest["ac_sn"].map(_dnm)
 
             fig_risk = go.Figure(go.Bar(
-                y=latest["ac_sn"].astype(str),
+                y=latest["Display"],
                 x=latest[pred_col],
                 orientation="h",
                 marker_color=latest["color"],
@@ -312,8 +435,89 @@ with tab_status:
             fig_risk.update_layout(
                 title=title,
                 xaxis=dict(tickvals=[0, 1], ticktext=["Normal", "Alert"], range=[0, 1.2]),
-                yaxis_title="MSN",
+                yaxis_title="Aircraft",
                 height=max(300, len(latest) * 28),
                 margin=dict(l=10, r=10, t=40, b=10),
             )
             st.plotly_chart(fig_risk, use_container_width=True)
+
+# ── Threshold Analysis (EDA) ──────────────────────────────────────────────────
+with tab_eda:
+    st.subheader("What does a pre-failure flight look like?")
+    st.markdown(
+        "For each degradation signal, the full flight history is split by the "
+        "model's prediction: **normal** (green) vs **predicted pre-failure** (red). "
+        "When the red distribution's median sits beyond the normal P75/P90, the "
+        "signal physically confirms what the model flags — the valve in pre-failure "
+        "opens slower, stays open longer and delivers less N2. "
+        "Use the **separation** column to see which signals discriminate best."
+    )
+    st.caption(
+        "Computed over the full loaded history (ignores the sidebar filter) so the "
+        "distributions are stable. Signals need ≥30 normal and ≥10 pre-failure "
+        "flights to be analysed."
+    )
+
+    side_pick = st.radio("Engine side", ["LH", "RH"], horizontal=True, key="eda_side")
+    df_eda = df_lh_full if side_pick == "LH" else df_rh_full
+    pred_eda = "pre_lh_sav_failure_prediction" if side_pick == "LH" else "pre_rh_sav_failure_prediction"
+    col_pick = 0 if side_pick == "LH" else 1
+
+    if df_eda.empty or pred_eda not in df_eda.columns:
+        st.info("Prediction column not available — cannot run the threshold analysis.")
+    else:
+        summary_rows = []
+        n_plotted = 0
+        plot_cols = st.columns(2)
+
+        for signal_name, (lh_col, rh_col, unit, _caption, bad_dir) in SIGNALS.items():
+            raw_col = lh_col if col_pick == 0 else rh_col
+            col = _resolve_col(df_eda, raw_col)
+            if col is None:
+                continue
+            stats = _signal_eda(df_eda, col, pred_eda)
+            if stats is None:
+                continue
+
+            # Separation: share of pre-failure flights beyond the normal P75
+            if bad_dir == "up":
+                sep = float((stats["alert"] > stats["p75_normal"]).mean())
+                confirms = stats["median_alert"] > stats["p75_normal"]
+            else:
+                sep = float((stats["alert"] < stats["p25_normal"]).mean())
+                confirms = stats["median_alert"] < stats["p25_normal"]
+
+            summary_rows.append({
+                "Signal": signal_name,
+                "Direction": "↑ rising is bad" if bad_dir == "up" else "↓ falling is bad",
+                "Median — normal": round(stats["median_normal"], 2),
+                "Median — pre-failure": round(stats["median_alert"], 2),
+                "Normal P90" if bad_dir == "up" else "Normal P10":
+                    round(stats["p90_normal"] if bad_dir == "up" else stats["p10_normal"], 2),
+                "Separation (% pre-failure beyond normal P75/P25)": f"{sep:.0%}",
+                "Confirms pre-failure?": "✅" if confirms else "⚠️ weak",
+            })
+
+            with plot_cols[n_plotted % 2]:
+                st.plotly_chart(
+                    _eda_histogram(stats, f"{signal_name} — {side_pick}", unit, bad_dir),
+                    use_container_width=True,
+                )
+            n_plotted += 1
+
+        if summary_rows:
+            st.subheader("Signal separation summary")
+            st.dataframe(pd.DataFrame(summary_rows), use_container_width=True, hide_index=True)
+            st.markdown(
+                "**Reading this table** — a signal *confirms* pre-failure when the "
+                "median of the predicted pre-failure population lies beyond the "
+                "normal P75 (P25 for falling signals). Those signals can be used as "
+                "physical sanity checks of the model: an aircraft flagged by the "
+                "model **and** beyond the normal P90 on a confirming signal deserves "
+                "priority inspection."
+            )
+        else:
+            st.info(
+                "Not enough flights in both classes to run the analysis "
+                "(need ≥30 normal and ≥10 pre-failure flights per signal)."
+            )

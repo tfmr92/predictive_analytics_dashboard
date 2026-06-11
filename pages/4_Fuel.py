@@ -9,7 +9,7 @@ import plotly.graph_objects as go
 import numpy as np
 import streamlit as st
 
-from utils.drive_loader import load, clean_df, make_prefix_map
+from utils.drive_loader import load, clean_df, make_prefix_map, display_name
 
 st.set_page_config(page_title="Fuel Consumption", layout="wide")
 
@@ -38,12 +38,15 @@ if AC_COL:
 _fuel_prefix_map = make_prefix_map()
 df = clean_df(df, date_col="date", ac_col=AC_COL, prefix_map=_fuel_prefix_map)
 
+def _dnm(msn) -> str:
+    return display_name(str(msn), _fuel_prefix_map)
+
 # ── Sidebar controls ────────────────────────────────────────────
 with st.sidebar:
     st.header("Filters")
     days_back = st.slider("Days of history", 30, 365, 120)
     all_ac = sorted(df[AC_COL].dropna().unique().tolist()) if AC_COL else []
-    selected_ac = st.multiselect("Aircraft (MSN)", options=all_ac, default=all_ac)
+    selected_ac = st.multiselect("Aircraft", options=all_ac, default=all_ac, format_func=_dnm)
 
 cutoff = pd.Timestamp.now() - pd.Timedelta(days=days_back)
 if selected_ac and AC_COL:
@@ -185,13 +188,17 @@ if cruise_cols and AC_COL:
         .sort_values("Avg Cruise Fuel (kg)", ascending=False)
     )
     fleet_mean = eff["Avg Cruise Fuel (kg)"].mean()
+    _n_eff_total = len(eff)
+    eff = eff.head(10)  # top 10 highest burners — the actionable end of the ranking
+    if _n_eff_total > 10:
+        st.caption(f"Top 10 highest cruise burners of {_n_eff_total} aircraft (fleet avg from all).")
     eff["color"] = eff["Avg Cruise Fuel (kg)"].apply(
         lambda x: "#ef4444" if x > fleet_mean * 1.05 else "#22c55e"
     )
 
     fig_eff = go.Figure(go.Bar(
         x=eff["Avg Cruise Fuel (kg)"],
-        y=eff[AC_COL].astype(str),
+        y=eff[AC_COL].astype(str).map(_dnm),
         orientation="h",
         marker_color=eff["color"],
         hovertemplate="%{y}: %{x:.0f} kg<extra></extra>",
@@ -332,7 +339,7 @@ else:
     if not tails:
         st.info("No flights with valid cruise fuel data in the selected period.")
     else:
-        chosen = st.selectbox("Select aircraft (MSN)", options=tails, key="deg_msn")
+        chosen = st.selectbox("Select aircraft", options=tails, key="deg_msn", format_func=_dnm)
         g = df_base[df_base[AC_COL] == chosen].sort_values("date").reset_index(drop=True)
 
         if len(g) < _MIN_BASELINE_FLIGHTS:
