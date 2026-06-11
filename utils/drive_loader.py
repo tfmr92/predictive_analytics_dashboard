@@ -58,16 +58,29 @@ def load_ac_master() -> pd.DataFrame:
 @st.cache_data(ttl=3600, show_spinner=False)
 def make_prefix_map() -> dict:
     """Returns {TCRF_SN: registration} e.g. {'20077': 'PR-PXA'}.
-    Empty dict when ac_master is unavailable (prefix display degrades gracefully)."""
+    Each serial is registered under every format the report parquets use:
+    full TRAX SN ('19020077'), 5-digit TCRF suffix ('20077') and the
+    TCRF archive form ('06120077' = '061' + suffix). Empty dict when
+    ac_master is unavailable (prefix display degrades gracefully)."""
     df = load_ac_master()
     if df.empty or "TCRF_SN" not in df.columns or "AC" not in df.columns:
         return {}
-    return dict(zip(df["TCRF_SN"].astype(str).str.strip(), df["AC"].astype(str).str.strip()))
+    prefix_map: dict = {}
+    for sn, ac in zip(df["TCRF_SN"].astype(str).str.strip(), df["AC"].astype(str).str.strip()):
+        prefix_map[sn] = ac
+        if sn.isdigit() and len(sn) >= 5:
+            suffix = sn[-5:]
+            prefix_map.setdefault(suffix, ac)
+            prefix_map.setdefault("061" + suffix, ac)
+    return prefix_map
 
 
 def display_name(msn: str, prefix_map: dict) -> str:
     """'PR-PXA · 20077' if prefix available, else just '20077'."""
-    prefix = prefix_map.get(str(msn).strip(), "")
+    key = str(msn).strip()
+    if key.endswith(".0"):
+        key = key[:-2]
+    prefix = prefix_map.get(key, "")
     return f"{prefix} · {msn}" if prefix else str(msn)
 
 
@@ -87,5 +100,7 @@ def clean_df(
         return df
     if ac_col and ac_col in df.columns and prefix_map:
         valid = set(prefix_map.keys())
-        df = df[df[ac_col].astype(str).isin(valid)]
+        # Normalize float-typed serials ('20018.0' → '20018') before matching
+        serials = df[ac_col].astype(str).str.strip().str.replace(r"\.0$", "", regex=True)
+        df = df[serials.isin(valid)]
     return df.reset_index(drop=True)
