@@ -38,14 +38,14 @@ def _hard_landing_severity(row, acol: str) -> str:
     gw = row.get("gross_weight", MLW_KG)
     g_lim = _weight_adjusted_g_limit(gw)
     if g >= g_lim + 0.3:
-        return "🔴 Severe — Inspect (AMM 05-50-03)"
+        return "Severe — Inspect (AMM 05-50-03)"
     elif g >= g_lim:
-        return "🟡 Hard — Monitor"
+        return "Hard — Monitor"
     else:
-        return "🟢 Normal"
+        return "Normal"
 
 
-st.title("🛞 Wheels & Brakes — ATA 32")
+st.title(":material/build: Wheels & Brakes — ATA 32")
 st.markdown(
     "Tracks wheel and brake health across 6 gear positions. "
     "Hard landing severity uses a **weight-adjusted threshold** per AMM MPP7166_05-50-03 "
@@ -90,7 +90,7 @@ if "date" in df.columns:
 
 # ── Sidebar controls ──────────────────────────────────────────
 with st.sidebar:
-    st.header("Filters")
+    st.header(":material/insights: Filters")
     days_back = st.slider("Days of history", 30, 365, 120)
     all_ac = sorted(df[_disp_col].dropna().unique().tolist()) if _disp_col in df.columns else []
     selected_ac = st.multiselect("Aircraft (MSN)", options=all_ac, default=all_ac)
@@ -100,7 +100,7 @@ with st.sidebar:
         help="Carbon brake removal threshold. Adjust per your Maintenance Manual.",
     )
     st.divider()
-    st.subheader("AMM Reference")
+    st.subheader(":material/straighten: AMM Reference")
     st.caption(f"Hard landing: **MPP7166_05-50-03**")
     st.caption(f"Wheel overspeed: **MPP7166_05-50-30** ({TIRE_SPEED_MAX} kts)")
     st.caption(f"LG down overspeed: **MPP7166_05-50-27**")
@@ -142,17 +142,17 @@ hard_lh = int(df["_hl_flag_lh"].sum()) if "_hl_flag_lh" in df.columns else 0
 hard_rh = int(df["_hl_flag_rh"].sum()) if "_hl_flag_rh" in df.columns else 0
 
 c1, c2, c3, c4 = st.columns(4)
-c1.metric("✈️ Aircraft with removal alert", len(ac_in_alert))
-c2.metric("🔴 Flights with removal alert", total_alerts)
-c3.metric("⚠️ Hard landings — LH", hard_lh,
+c1.metric("Aircraft with removal alert", len(ac_in_alert))
+c2.metric("Flights with removal alert", total_alerts)
+c3.metric("Hard landings — LH", hard_lh,
           help="Weight-adjusted threshold (AMM MPP7166_05-50-03)")
-c4.metric("⚠️ Hard landings — RH", hard_rh,
+c4.metric("Hard landings — RH", hard_rh,
           help="Weight-adjusted threshold (AMM MPP7166_05-50-03)")
 
 st.divider()
 
 # ── Section 1: Removal Priority Table ────────────────────────────────
-st.subheader("1. Removal Priority — Wheels to Act On")
+st.subheader(":material/build: 1. Removal Priority — Wheels to Act On")
 st.caption(
     "Sorted by urgency: current alert first, then highest alert rate. "
     f"Remaining cycles = {WHEEL_LIFE}-cycle life limit minus cycles in service."
@@ -178,7 +178,7 @@ if "ac_sn" in df.columns:
             rows.append({
                 "MSN": ac,
                 "Position": pos_label,
-                "Current Alert": "🔴 REMOVE" if alert else "✅ OK",
+                "Current Alert": "REMOVE" if alert else "OK",
                 "Alert Rate (%)": round(alert_rate, 1),
                 "Cycles In Service": round(tsi) if tsi is not None else "—",
                 "Est. Remaining Cycles": round(remaining) if remaining is not None else "—",
@@ -209,7 +209,7 @@ else:
 st.divider()
 
 # ── Section 2: Degradation Heatmap ──────────────────────────────────
-st.subheader("2. Alert Rate Heatmap — MSN × Wheel Position")
+st.subheader(":material/grid_view: 2. Alert Rate Heatmap — MSN × Wheel Position")
 st.caption(
     "Color is fixed to an absolute 0–100% scale, so a 5% cell never reads as red "
     "as a 90% one. Each cell shows the exact alert rate."
@@ -244,7 +244,7 @@ if available_preds and "ac_sn" in df.columns:
 st.divider()
 
 # ── Section 3: Cycles In Service ────────────────────────────────────
-st.subheader("3. Cycles In Service — Progress Toward Removal Threshold")
+st.subheader(":material/build: 3. Cycles In Service — Progress Toward Removal Threshold")
 st.caption(
     f"Red dashed line = {WHEEL_LIFE}-cycle removal threshold. "
     "Aircraft above the line must be scheduled for wheel/brake change."
@@ -277,7 +277,7 @@ if tsi_cols_available and "ac_sn" in df.columns:
 st.divider()
 
 # ── Section 4: Hard Landing Assessment ───────────────────────────────
-st.subheader("4. Hard Landing Assessment — AMM MPP7166_05-50-03")
+st.subheader(":material/flight_land: 4. Hard Landing Assessment — AMM MPP7166_05-50-03")
 st.caption(
     "Scatter: peak G-force vs. gross weight. The **curved threshold line** approximates the "
     "weight-dependent envelope from the AMM. Points above it trigger a formal inspection. "
@@ -285,7 +285,7 @@ st.caption(
 )
 
 tab_lh_land, tab_rh_land, tab_bounce = st.tabs(
-    ["Left Main Gear (LH)", "Right Main Gear (RH)", "Bounce Count"]
+    [":material/speed: Left Main Gear (LH)", ":material/speed: Right Main Gear (RH)", ":material/insights: Bounce Count"]
 )
 
 for tab_l, acol, impact_col, label in [
@@ -412,7 +412,7 @@ for tab_l, acol, impact_col, label in [
         inspect_events = df_land[df_land["Severity"].str.contains("Inspect", na=False)]
         if not inspect_events.empty:
             with st.expander(
-                f"🔴 {len(inspect_events)} event(s) above inspection threshold — AMM action required"
+                f"{len(inspect_events)} event(s) above inspection threshold — AMM action required"
             ):
                 st.warning(
                     "**AMM MPP7166_05-50-03** — *Do An Inspection After A Hard Landing*\n\n"
@@ -503,7 +503,7 @@ with tab_bounce:
 st.divider()
 
 # ── Section 5: Life Analysis — Weibull ────────────────────────────────────────
-st.subheader("5. Life Analysis — Component Removal History")
+st.subheader(":material/build: 5. Life Analysis — Component Removal History")
 st.caption(
     "Weibull analysis of historical removal cycles (TRAX data). "
     "B10 = 10% of units removed by this cycle count; B50 = median removal life. "
@@ -517,7 +517,7 @@ try:
     _df_wnb_m   = load("e2_wnb_maintenance.parquet")
     _df_brake_m = load("e2_brake_maintenance.parquet")
 
-    _tab_wheel, _tab_brake = st.tabs(["Wheels (MLG/NLG)", "Brakes"])
+    _tab_wheel, _tab_brake = st.tabs([":material/build: Wheels (MLG/NLG)", ":material/build: Brakes"])
 
     for _tab, _df_m, _comp in [
         (_tab_wheel, _df_wnb_m,   "Wheel"),
@@ -634,3 +634,205 @@ try:
 
 except ImportError:
     st.info("scipy not installed — add `scipy>=1.12.0` to requirements.txt.")
+
+st.divider()
+
+# ── Section 6: Model Track Record — Predicted vs Confirmed Removals ──────────────
+st.subheader(":material/analytics: 6. Model Track Record — Predicted vs Confirmed Removals")
+
+LEAD_WINDOW_DAYS = 90
+
+# Map raw TRAX POSITION variants directly to the safe prediction-column key
+# (prediction_<key>). Faithfully replicates the producer's _POSITION_MAP variants
+# -> canonical 'MLG 1'..'RH NLG' -> _SAFE key in
+# repositories/azul/save_wheel_brake_report/ops/_wheel_brake_data_prep.py.
+# KEEP IN SYNC WITH PRODUCER: any new variant added there must be added here too.
+_POSITION_TO_KEY = {
+    # Canonical
+    "MLG 1": "mlg1", "MLG 2": "mlg2", "MLG 3": "mlg3", "MLG 4": "mlg4",
+    "LH NLG": "nlg_lh", "RH NLG": "nlg_rh",
+    # No space
+    "MLG1": "mlg1", "MLG2": "mlg2", "MLG3": "mlg3", "MLG4": "mlg4",
+    "LHNLG": "nlg_lh", "RHNLG": "nlg_rh",
+    # Number only
+    "1": "mlg1", "2": "mlg2", "3": "mlg3", "4": "mlg4",
+    # LH/RH with number
+    "LH MLG 1": "mlg1", "LH MLG 2": "mlg2",
+    "RH MLG 1": "mlg3", "RH MLG 2": "mlg4",
+    "MLG LH 1": "mlg1", "MLG LH 2": "mlg2",
+    "MLG RH 1": "mlg3", "MLG RH 2": "mlg4",
+    # Inboard / Outboard
+    "LH INBD": "mlg1", "LH OUTBD": "mlg2",
+    "RH INBD": "mlg3", "RH OUTBD": "mlg4",
+    "INBD LH": "mlg1", "OUTBD LH": "mlg2",
+    "INBD RH": "mlg3", "OUTBD RH": "mlg4",
+    "LH INBOARD": "mlg1", "LH OUTBOARD": "mlg2",
+    "RH INBOARD": "mlg3", "RH OUTBOARD": "mlg4",
+    # Forward / Aft
+    "LH FWD": "mlg1", "LH AFT": "mlg2",
+    "RH FWD": "mlg3", "RH AFT": "mlg4",
+    "FWD LH": "mlg1", "AFT LH": "mlg2",
+    "FWD RH": "mlg3", "AFT RH": "mlg4",
+    # Wheel / Brake numbered
+    "WHEEL 1": "mlg1", "WHEEL 2": "mlg2", "WHEEL 3": "mlg3", "WHEEL 4": "mlg4",
+    "BRAKE 1": "mlg1", "BRAKE 2": "mlg2", "BRAKE 3": "mlg3", "BRAKE 4": "mlg4",
+    "BRK 1": "mlg1", "BRK 2": "mlg2", "BRK 3": "mlg3", "BRK 4": "mlg4",
+    "BRAKE1": "mlg1", "BRAKE2": "mlg2", "BRAKE3": "mlg3", "BRAKE4": "mlg4",
+    # NLG variants
+    "NLG LH": "nlg_lh", "NLG RH": "nlg_rh",
+    "NLG": "nlg_lh",
+}
+
+
+def _resolve_pos_key(raw):
+    """Resolve a raw TRAX POSITION string to its safe gear-position key
+    (strip + upper lookup), or None when the position is absent from the map."""
+    return _POSITION_TO_KEY.get(str(raw).strip().upper())
+
+
+@st.cache_data(ttl=300)
+def _load_track_record():
+    """Cross-check model predictions against real TRAX removals — per position.
+
+    Reloads the FULL unfiltered report (long format: exactly one prediction_<key>
+    non-null per flight row). Each TRAX removal is attributed to its OWN gear
+    position via _resolve_pos_key, then matched only against that position's
+    prediction column within a 90-day lead window. Returns one row per removal
+    with its catch status. Removals whose TRAX position is absent from the map
+    ('Position not mapped') or that have no flights of that position in the
+    window ('No telemetry in window') are non-evaluable and excluded from the
+    catch rate.
+    """
+    rep = load("e2_wnb_report.parquet")
+    if rep.empty:
+        return pd.DataFrame()
+
+    rep = rep.copy()
+    rep["date"] = pd.to_datetime(rep.get("date"), errors="coerce")
+    pred_cols = [c for c in rep.columns if c.startswith("prediction_")]
+
+    _key = lambda s: str(s).split(".")[0].strip()[-5:]
+    rep["_key"] = rep["ac_sn"].map(_key) if "ac_sn" in rep.columns else None
+    rep = rep[["_key", "date"] + pred_cols]
+
+    req_cols = {"AC_SN", "POSITION", "TRANSACTION_DATE"}
+    frames = []
+    for _fname, _comp in [
+        ("e2_wnb_maintenance.parquet", "Wheel"),
+        ("e2_brake_maintenance.parquet", "Brake"),
+    ]:
+        m = load(_fname)
+        if m.empty or not req_cols.issubset(m.columns):
+            continue
+        m = m.copy()
+        m["Component"] = _comp
+        frames.append(m)
+
+    if not frames:
+        return pd.DataFrame()
+
+    maint = pd.concat(frames, ignore_index=True)
+    maint["TRANSACTION_DATE"] = pd.to_datetime(maint["TRANSACTION_DATE"], errors="coerce")
+    maint["_key"] = maint["AC_SN"].map(_key)
+
+    records = []
+    for _, r in maint.iterrows():
+        key = r["_key"]
+        td = r["TRANSACTION_DATE"]
+        if pd.isna(td) or not key:
+            continue
+
+        pos_key = _resolve_pos_key(r["POSITION"])
+        if pos_key is None:
+            status, lead, caught, evaluable = "Position not mapped", np.nan, False, False
+        else:
+            col = "prediction_" + pos_key
+            win_start = td - pd.Timedelta(days=LEAD_WINDOW_DAYS)
+            sub = rep[(rep["_key"] == key) & (rep["date"] >= win_start) & (rep["date"] <= td)]
+            pos_rows = sub[sub[col].notna()] if col in sub.columns else sub.iloc[0:0]
+
+            if pos_rows.empty:
+                status, lead, caught, evaluable = "No telemetry in window", np.nan, False, False
+            else:
+                evaluable = True
+                flagged = pos_rows[pos_rows[col] == 1]
+                caught = not flagged.empty
+                if caught:
+                    status = "Caught"
+                    lead = (td - flagged["date"].min()).days
+                else:
+                    status, lead = "Missed", np.nan
+
+        reason = "—"
+        for _rc in ("REMOVAL_REASON", "DEFECT_DESCRIPTION"):
+            if _rc in r.index and pd.notna(r[_rc]) and str(r[_rc]).strip():
+                reason = str(r[_rc]).strip()
+                break
+
+        records.append({
+            "_key": key,
+            "Component": r.get("Component", "—"),
+            "Position": str(r["POSITION"]),
+            "RemovalDate": td,
+            "Status": status,
+            "LeadDays": lead,
+            "Reason": reason,
+            "Evaluable": evaluable,
+            "Caught": caught,
+        })
+
+    return pd.DataFrame(records)
+
+
+_track = _load_track_record()
+
+if _track.empty or not _track["Evaluable"].any():
+    st.info(
+        "No evaluable removals yet — this needs both model predictions "
+        "(`e2_wnb_report.parquet`) and TRAX removals "
+        "(`e2_wnb_maintenance.parquet` / `e2_brake_maintenance.parquet`) "
+        "with telemetry coverage in the 90-day window before a removal. "
+        "Run the Snowflake notebook and the wheel/brake report jobs to populate them."
+    )
+else:
+    _eval = _track[_track["Evaluable"]]
+    _n = int(len(_eval))
+    _k = int(_eval["Caught"].sum())
+    _rate = (_k / _n * 100) if _n else 0.0
+    _leads = _eval.loc[_eval["Caught"], "LeadDays"].dropna()
+    _median_lead = _leads.median() if not _leads.empty else None
+
+    k1, k2, k3, k4 = st.columns(4)
+    k1.metric("Removals evaluated", _n, help="Telemetry-covered removals only.")
+    k2.metric("Caught in advance", _k)
+    k3.metric("Catch rate", f"{_rate:.0f}%")
+    k4.metric(
+        "Median lead time",
+        f"{_median_lead:.0f} d" if _median_lead is not None else "—",
+        help="Days from first alert to removal, caught removals only.",
+    )
+
+    _disp = _track.sort_values("RemovalDate", ascending=False).head(30).copy()
+    _disp["MSN"] = _disp["_key"].map(lambda m: display_name(m, _prefix_map))
+    _table = pd.DataFrame({
+        "MSN": _disp["MSN"].values,
+        "Component": _disp["Component"].values,
+        "Position": _disp["Position"].values,
+        "Removal date": _disp["RemovalDate"].dt.strftime("%d-%b-%Y").values,
+        "Status": _disp["Status"].values,
+        "Lead time (days)": _disp["LeadDays"].values,
+        "Removal reason": _disp["Reason"].values,
+    })
+    st.dataframe(_table, use_container_width=True, hide_index=True)
+
+    st.caption(
+        "Retrospective track record over the period the prediction report covers. "
+        "Per-position attribution — each removal is matched only to its own "
+        f"gear-position model within a {LEAD_WINDOW_DAYS}-day lead window. This is "
+        "legitimate model validation (per-position trained models cross-checked "
+        "against TRAX removals), not a live alert. '' rows are non-evaluable and "
+        "excluded from the catch rate: 'No telemetry in window' has no flights of "
+        "that position in the window, and 'Position not mapped' has a TRAX position "
+        "absent from the model's position map — unmapped positions are excluded, "
+        "not counted as a catch or a miss."
+    )

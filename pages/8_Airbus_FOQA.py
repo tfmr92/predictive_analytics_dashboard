@@ -4,20 +4,26 @@ Speed envelope (VMO/MMO/VLE), EGT takeoff/continuous limits, engine vibration
 advisories and oil-system flags per flight.
 """
 
+import numpy as np
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
 
-from utils.drive_loader import load
+from utils.drive_loader import load, render_freshest_badge
 
 st.set_page_config(page_title="Airbus FOQA/MOQA", layout="wide")
 
-st.title("🔍 FOQA / MOQA — Airbus A320 & A330")
+st.title(":material/monitoring: FOQA / MOQA — Airbus A320 & A330")
 st.markdown(
     "Per-flight exceedance monitoring from decoded QAR/DAR data: speed envelope "
     "(VMO/MMO/VLE), EGT takeoff & continuous limits, N1/N2 vibration advisories "
     "and oil-system flags."
+)
+
+render_freshest_badge(
+    ["airbus_a320_foqa_report.parquet", "airbus_a330_foqa_report.parquet"],
+    label="Airbus FOQA report",
 )
 
 AC_COL = "tail_number"
@@ -51,6 +57,98 @@ _FLAG_LABELS = {
     "oil_qty_low_flag": "Oil quantity low",
 }
 
+# Certified FCOM/AMM limits for engine-trend overlays.
+# mirrors _LIMITS in airbus_foqa_compute_op.py (certified FCOM/AMM values); keep in sync.
+# EGT limits intentionally omitted — producer marks them placeholder/TBD pending CFM/RR OEM data.
+_FLEET_LIMITS = {
+    "A320FAM": {
+        "n1_vib_advisory": 6.0,
+        "n1_vib_limit": 5.0,
+        "n2_vib_advisory": 4.3,
+        "n2_vib_limit": 5.0,
+        "oil_press_advisory_psi": 16.0,
+        "oil_press_red_psi": 13.0,
+    },
+    "A330": {
+        "n1_vib_advisory": 5.7,
+        "n2_vib_advisory": 5.6,
+        "oil_press_low_psi": 30.0,
+    },
+}
+
+_FLEET_KEY = {"A320/A321": "A320FAM", "A330": "A330"}
+
+# dashboard column -> list of (limit_key, severity, direction, label)
+_TREND_LIMITS = {
+    "n1_vib_max": [
+        ("n1_vib_advisory", "amber", "up", "N1 vib advisory"),
+        ("n1_vib_limit", "red", "up", "N1 vib AMM limit"),
+    ],
+    "n2_vib_max": [
+        ("n2_vib_advisory", "amber", "up", "N2 vib advisory"),
+        ("n2_vib_limit", "red", "up", "N2 vib AMM limit"),
+    ],
+    "oil_press_min_1_psi": [
+        ("oil_press_advisory_psi", "amber", "down", "Oil press advisory"),
+        ("oil_press_red_psi", "red", "down", "Oil press red"),
+        ("oil_press_low_psi", "red", "down", "Oil press low — ENG shutdown"),
+    ],
+    "oil_press_min_2_psi": [
+        ("oil_press_advisory_psi", "amber", "down", "Oil press advisory"),
+        ("oil_press_red_psi", "red", "down", "Oil press red"),
+        ("oil_press_low_psi", "red", "down", "Oil press low — ENG shutdown"),
+    ],
+}
+
+_SEV_STYLE = {
+    "amber": dict(line_color="#d97706", line_dash="dot"),
+    "red": dict(line_color="#dc2626", line_dash="dash"),
+}
+
+
+def _add_limit_overlays(fig, fleet_key, col, ymin, ymax):
+    """Overlay certified FCOM/AMM limit lines + a shaded exceedance band on a trend chart."""
+    if fleet_key not in _FLEET_LIMITS or col not in _TREND_LIMITS:
+        return
+    limits = _FLEET_LIMITS.get(fleet_key, {})
+    specs = _TREND_LIMITS.get(col, [])
+    applicable = [
+        (key, sev, direction, label)
+        for key, sev, direction, label in specs
+        if limits.get(key) is not None
+    ]
+    if not applicable:
+        return
+
+    red_vals = []
+    direction = applicable[0][2]
+    for key, sev, _dir, label in applicable:
+        value = limits[key]
+        style = _SEV_STYLE[sev]
+        fig.add_hline(
+            y=value, line_color=style["line_color"], line_dash=style["line_dash"],
+            line_width=1.5, annotation_text=f"{label} ({value:g})",
+            annotation_position="top left" if direction == "up" else "bottom left",
+        )
+        if sev == "red":
+            red_vals.append(value)
+
+    if red_vals:
+        ymin_v = ymin if ymin is not None and not np.isnan(ymin) else None
+        ymax_v = ymax if ymax is not None and not np.isnan(ymax) else None
+        if direction == "up":
+            y0 = max(red_vals)
+            top_ref = ymax_v if ymax_v is not None else y0
+            y1 = max(top_ref, y0 * 1.02)
+        else:
+            y0 = min(red_vals)
+            bot_ref = ymin_v if ymin_v is not None else y0
+            y1 = min(bot_ref, y0 * 0.98)
+        fig.add_hrect(
+            y0=y0, y1=y1, fillcolor="rgba(220,38,38,0.10)",
+            layer="below", line_width=0,
+        )
+
 
 @st.cache_data(ttl=300)
 def _load(filename: str) -> pd.DataFrame:
@@ -80,7 +178,7 @@ if _latest_date is not None and pd.notna(_latest_date):
 
 # ── Sidebar ───────────────────────────────────────────────────────────────────
 with st.sidebar:
-    st.header("Filters")
+    st.header(":material/insights: Filters")
     days_back = st.slider("Days of history", 7, 365, 60)
 
 cutoff = pd.Timestamp.now() - pd.Timedelta(days=days_back)
@@ -110,7 +208,7 @@ def _exceedance_summary(df: pd.DataFrame) -> pd.DataFrame:
 
 for fleet_label, df_fleet in [("A320/A321", df_a320), ("A330", df_a330)]:
     st.divider()
-    st.header(f"✈️ {fleet_label}")
+    st.header(f":material/insights: {fleet_label}")
 
     if df_fleet.empty:
         st.info(f"No {fleet_label} FOQA data available.")
@@ -134,23 +232,23 @@ for fleet_label, df_fleet in [("A320/A321", df_a320), ("A330", df_a330)]:
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Aircraft monitored", n_ac)
     c2.metric("Flights analysed", f"{n_flights:,}")
-    c3.metric("🔴 Limit exceedances", n_limit,
+    c3.metric("Limit exceedances", n_limit,
               help="VMO/MMO/VLE, EGT takeoff/continuous, vibration limit, tire overspeed")
-    c4.metric("🟡 Advisories", n_adv,
+    c4.metric("Advisories", n_adv,
               help="Vibration advisories and oil pressure/temperature/quantity flags")
 
     # Triage banner
     crit = summary[summary["Limit exceedances"] > 0]
     if not crit.empty:
         st.error(
-            "**🚨 Limit exceedances this period:**\n\n" + "\n".join(
+            "**Limit exceedances this period:**\n\n" + "\n".join(
                 f"- **{r[AC_COL]}** — {int(r['Limit exceedances'])} limit event(s), "
                 f"{int(r['Advisories'])} advisory(ies) in {int(r['Flights'])} flights"
                 for _, r in crit.head(10).iterrows()
             )
         )
     else:
-        st.success(f"✅ No limit exceedances in the last {days_back} days.")
+        st.success(f"No limit exceedances in the last {days_back} days.")
 
     col_bar, col_types = st.columns(2)
 
@@ -200,7 +298,13 @@ for fleet_label, df_fleet in [("A320/A321", df_a320), ("A330", df_a330)]:
             st.success("No exceedance events of any type in this window.")
 
     # ── Engine trend charts ────────────────────────────────────────────────────
-    with st.expander(f"📈 Engine trends — {fleet_label}", expanded=False):
+    with st.expander(f"Engine trends — {fleet_label}", expanded=False):
+        st.caption(
+            "Dashed/dotted lines mark certified FCOM/AMM advisory (amber) and "
+            "maintenance/red limits; shaded band is the exceedance zone (above for "
+            "vibration, below for oil pressure). EGT limits are omitted pending OEM "
+            "(CFM/RR) confirmation."
+        )
         trend_cols = [
             ("egt1_max_c", "EGT max — Engine 1 (°C)"),
             ("egt2_max_c", "EGT max — Engine 2 (°C)"),
@@ -225,6 +329,10 @@ for fleet_label, df_fleet in [("A320/A321", df_a320), ("A330", df_a330)]:
             fig_t.update_traces(marker_size=5)
             fig_t.update_layout(height=300, margin=dict(t=40, b=20, l=10, r=10),
                                 xaxis=dict(tickformat="%d-%b-%y"), showlegend=n_ac <= 12)
+            vals = df_plot[col].to_numpy(dtype=float)
+            ymin = float(np.nanmin(vals)) if vals.size and not np.all(np.isnan(vals)) else None
+            ymax = float(np.nanmax(vals)) if vals.size and not np.all(np.isnan(vals)) else None
+            _add_limit_overlays(fig_t, _FLEET_KEY.get(fleet_label), col, ymin, ymax)
             with plot_cols[n_plotted % 2]:
                 st.plotly_chart(fig_t, use_container_width=True)
             n_plotted += 1
@@ -235,7 +343,7 @@ for fleet_label, df_fleet in [("A320/A321", df_a320), ("A330", df_a330)]:
     flag_cols_present = [c for c in _LIMIT_FLAGS + _ADVISORY_FLAGS if c in sub.columns]
     flagged = sub[sub[flag_cols_present].fillna(False).astype(bool).any(axis=1)] if flag_cols_present else pd.DataFrame()
     if not flagged.empty:
-        with st.expander(f"📋 {len(flagged)} flagged flight(s) — detail"):
+        with st.expander(f"{len(flagged)} flagged flight(s) — detail"):
             detail_cols = [c for c in
                            ["date", AC_COL, "exceedance_types", "mach_max", "cas_max_kias",
                             "egt1_max_c", "egt2_max_c", "n1_vib_max", "n2_vib_max",

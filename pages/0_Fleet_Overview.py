@@ -1,22 +1,39 @@
 """
 Fleet Overview — Multi-fleet predictive maintenance status.
 One row per aircraft, color-coded by worst alert across all monitored systems.
-Covers E195-E2 (SAV, W&B, Oxygen, FOQA) + A320/A330 (FOQA).
+Covers E195-E2 (SAV, W&B, Oxygen, FOQA, Fuel) + A320/A330 (FOQA).
 """
 
+import math
 from datetime import date, timedelta
 
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
-from utils.drive_loader import load, make_prefix_map, display_name, clean_df
+from utils.drive_loader import load, make_prefix_map, display_name, clean_df, get_file_mtime
 
-st.set_page_config(page_title="Fleet Overview", layout="wide", page_icon="🗺️")
+st.set_page_config(page_title="Fleet Overview", layout="wide")
 
 PSI_CYAN  = 1155   # Oxygen: Observer Oxy Lo Press — cyan CAS
 PSI_AMBER = 845    # Oxygen: Crew Oxy Lo Press — amber CAS / no dispatch
 FORECAST_HORIZON_DAYS = 30  # fixed planning horizon for upcoming inspections
+
+# Pipeline sources for the health panel: (label, df_key, report filename, producing Dagster job).
+# 'Last refresh' keys off the Drive mtime of each filename — the producing job runs on a fixed
+# schedule regardless of new flights, so a stale mtime means the job stopped, not that the fleet is idle.
+PIPELINE_SOURCES = [
+    ("SAV LH (E2)",         "sav_lh",      "e2_sav_lh_report.parquet",        "save_sav_report"),
+    ("SAV RH (E2)",         "sav_rh",      "e2_sav_rh_report.parquet",        "save_sav_report"),
+    ("SAV A320 — Eng 1",    "sav_a320_e1", "airbus_sav_eng1_report.parquet",  "save_airbus_sav_report"),
+    ("SAV A320 — Eng 2",    "sav_a320_e2", "airbus_sav_eng2_report.parquet",  "save_airbus_sav_report"),
+    ("Oxygen (E2)",         "oxy",         "e2_oxy_report.parquet",           "save_oxy_report"),
+    ("FOQA E2",             "foqa",        "e2_foqa_report.parquet",          "e2_foqa_moqa_job"),
+    ("A320 FOQA",           "a320",        "airbus_a320_foqa_report.parquet", "airbus_foqa_moqa_job"),
+    ("A330 FOQA",           "a330",        "airbus_a330_foqa_report.parquet", "airbus_foqa_moqa_job"),
+    ("Wheels & Brakes (E2)","wnb",         "e2_wnb_report.parquet",           "save_wheel_brake_report"),
+    ("Fuel (E2)",           "fuel",        "e2_fuel_report.parquet",          "save_fuel_consumption_report"),
+]
 
 # ── Load all parquets (each is non-fatal if unavailable) ──────────────────────
 @st.cache_data(ttl=300)
@@ -69,7 +86,7 @@ for _k in _e2_keys:
 
 # ── Sidebar ───────────────────────────────────────────────────────────────────
 with st.sidebar:
-    st.header("Filters")
+    st.header(":material/insights: Filters")
     days_back = st.slider("Days of history", 7, 90, 30)
     fleet_filter = st.multiselect(
         "Fleet",
@@ -187,6 +204,69 @@ def _wnb_alerts(df_wnb: pd.DataFrame, cutoff_ts: pd.Timestamp) -> dict:
     return wnb_alert
 
 
+@st.cache_data(ttl=300)
+def _fuel_alerts(df_fuel: pd.DataFrame, cutoff_ts: pd.Timestamp) -> tuple[dict, dict]:
+    """E2 cruise-burn engine-degradation alerts vs each tail's OWN baseline.
+
+    Reuses the validated own-baseline method from 4_Fuel.py Section 5: per aircraft,
+    total cruise burn = sum of the cruise*fuelMeterFuelBurn*Kg columns, normalized to a
+    kg/h RATE via time_sec_cruise when present (else absolute kg, so route length no
+    longer confounds engine health). Baseline = median of each tail's earliest
+    ceil(30%)/>=5 in-window flights; recent = mean of its last 5 flights. Level 2 (red)
+    when recent > baseline x 1.10, level 1 (amber) when > x 1.05, else 0. Requires
+    >= 5 flights and a strictly positive baseline. Returns ({ac_sn: level},
+    {ac_sn: pct_above}); empty dicts if data / cruise columns are missing.
+    """
+    if df_fuel is None or df_fuel.empty:
+        return {}, {}
+    ac_col = next((c for c in ("ac_sn", "aircraftSerNum-1") if c in df_fuel.columns), None)
+    if ac_col is None or "date" not in df_fuel.columns:
+        return {}, {}
+    cruise_cols = [
+        c for c in df_fuel.columns
+        if c.startswith("cruise") and "fuelMeterFuelBurn" in c and c.endswith("Kg")
+    ]
+    if not cruise_cols:
+        return {}, {}
+
+    sub = df_fuel[df_fuel["date"] >= cutoff_ts].copy()
+    if sub.empty:
+        return {}, {}
+
+    for c in cruise_cols:
+        sub[c] = pd.to_numeric(sub[c], errors="coerce")
+    cruise_total = sub[cruise_cols].sum(axis=1)
+
+    # Normalize to kg/h when cruise duration is available; else absolute kg.
+    if "time_sec_cruise" in sub.columns:
+        dur_hr = pd.to_numeric(sub["time_sec_cruise"], errors="coerce") / 3600.0
+        metric = (cruise_total / dur_hr).where(dur_hr > 0)
+    else:
+        metric = cruise_total
+
+    sub = sub.assign(_fuel_metric=metric).dropna(subset=["_fuel_metric", ac_col, "date"])
+    if sub.empty:
+        return {}, {}
+
+    fuel_alert: dict = {}
+    fuel_pct: dict = {}
+    for msn, grp in sub.groupby(ac_col):
+        grp = grp.sort_values("date")
+        if len(grp) < 5:                                   # minimum sample guard
+            continue
+        n_base = min(len(grp), max(5, int(math.ceil(len(grp) * 0.30))))
+        baseline = float(grp["_fuel_metric"].iloc[:n_base].median())
+        if baseline <= 0:                                  # need a positive reference
+            continue
+        recent_n = min(5, len(grp))
+        recent_mean = float(grp["_fuel_metric"].iloc[-recent_n:].mean())
+        pct_above = (recent_mean - baseline) / baseline * 100.0
+        level = 2 if recent_mean > baseline * 1.10 else (1 if recent_mean > baseline * 1.05 else 0)
+        fuel_alert[str(msn)] = level
+        fuel_pct[str(msn)] = pct_above
+    return fuel_alert, fuel_pct
+
+
 # ── Build per-system alert snapshots ─────────────────────────────────────────
 
 # SAV LH
@@ -265,16 +345,21 @@ for fleet_key, fleet_label in [("a320", "A320"), ("a330", "A330")]:
 # Wheels & Brakes (ATA 32) — long-format OR aggregation across all 6 positions
 wnb_alert = _wnb_alerts(data["wnb"], cutoff)
 
+# Fuel (ATA 73/76) — cruise-burn engine-degradation vs each tail's own baseline
+fuel_alert, fuel_pct = _fuel_alerts(data["fuel"], cutoff)
+
 # SAV A320 — latest-start pre-failure prediction per engine
-sav_a320_alerts: dict = {}   # {tail: [eng_labels]}
+sav_a320_alerts: dict = {}   # {normalized tail: [eng_labels]} — any-engine pre-failure
+sav_a320_known: set = set()  # normalized tails with any SAV record (for matrix "—" fallback)
 for _key, _eng in [("sav_a320_e1", "Eng 1"), ("sav_a320_e2", "Eng 2")]:
     _df_sa = data.get(_key, pd.DataFrame())
     if _df_sa.empty or "sav_failure_pred" not in _df_sa.columns or "aircraft_id" not in _df_sa.columns:
         continue
     _df_sa = _df_sa[_df_sa["aircraft_id"].astype(str).str.strip() != ""]
+    sav_a320_known.update(_df_sa["aircraft_id"].astype(str).str.strip())
     _lat = _df_sa.sort_values("date").groupby("aircraft_id").last()
     for tail in _lat.index[_lat["sav_failure_pred"].eq(1)]:
-        sav_a320_alerts.setdefault(str(tail), []).append(_eng)
+        sav_a320_alerts.setdefault(str(tail).strip(), []).append(_eng)
 
 # ── Collect all aircraft ──────────────────────────────────────────────────────
 all_e2 = sorted(set(
@@ -283,6 +368,7 @@ all_e2 = sorted(set(
     + list(oxy_alert.keys())
     + list(foqa_exceedances.keys())
     + list(wnb_alert.keys())
+    + list(fuel_alert.keys())
 ))
 
 # ── Predictive catches (commercial KPI) ───────────────────────────────────────
@@ -294,11 +380,18 @@ sav_catch_msns = {
 }
 oxy_nodispatch_msns = {msn for msn, v in oxy_alert.items() if v == 2}
 wnb_catch_msns = {msn for msn, v in wnb_alert.items() if v == 1}
+# Fuel red-tier (>10% above own cruise-burn baseline) — engine-degradation catch
+fuel_catch_msns = {msn for msn, v in fuel_alert.items() if v == 2}
 airbus_catch = {key for key, n in airbus_alerts.items() if n > 5}
-predictive_catches = len(sav_catch_msns | oxy_nodispatch_msns | wnb_catch_msns) + len(airbus_catch)
+# A320 starter-valve pre-failure catches (binary sav_failure_pred == 1), keyed to
+# match airbus_catch ("A320:<tail>") so a tail flagged by both FOQA and SAV counts once.
+sav_a320_catch = {f"A320:{tail}" for tail in sav_a320_alerts}
+# Fuel cruise-burn own-baseline is excluded from the headline: it is a heuristic with no link to a confirmed failure (SAV/W&B/A320 SAV = model predictions, oxy amber = no-dispatch CAS, Airbus FOQA = certified-limit exceedances are the asserted catches).
+asserted_catches = len(sav_catch_msns | oxy_nodispatch_msns | wnb_catch_msns) + len(airbus_catch | sav_a320_catch)
+fuel_advisory_n = len(fuel_catch_msns)
 
 # ── KPI row ───────────────────────────────────────────────────────────────────
-st.title("🗺️ Fleet Overview")
+st.title(":material/dashboard: Fleet Overview")
 st.caption(f"Multi-fleet predictive maintenance · {date.today().strftime('%d-%b-%Y')} · {days_back}-day window")
 
 n_sav_alert = len(sav_catch_msns)
@@ -308,25 +401,29 @@ n_foqa      = sum(1 for v in foqa_exceedances.values() if v > 0)
 n_airbus    = sum(1 for v in airbus_alerts.values() if v > 0)
 
 c1, c2, c3, c4, c5, c6 = st.columns(6)
-c1.metric("✈️ E2 aircraft tracked", len(all_e2))
-c2.metric("🔴 SAV alerts (LH+RH)", n_sav_alert,
+c1.metric("E2 aircraft tracked", len(all_e2))
+c2.metric("SAV alerts (LH+RH)", n_sav_alert,
           help="Aircraft with predicted pre-failure on starter valve (latest flight)")
-c3.metric("💨 Oxy — no dispatch", n_oxy_red,
+c3.metric("Oxy — no dispatch", n_oxy_red,
           help=f"Latest PSI < {PSI_AMBER} — amber CAS, no departure")
-c4.metric("🔍 E2 FOQA exceedances", n_foqa,
+c4.metric("E2 FOQA exceedances", n_foqa,
           help=f"Aircraft with ≥1 engine/aircraft exceedance in last {days_back} days")
-c5.metric("🛫 Airbus FOQA alerts", n_airbus,
+c5.metric("Airbus FOQA alerts", n_airbus,
           help=f"A320/A330 aircraft with exceedances in last {days_back} days")
-c6.metric("🛡️ Unsched. removals flagged", predictive_catches,
+c6.metric("Unsched. removals flagged", asserted_catches,
           help="Distinct aircraft flagged with a critical predictive catch this period "
-               "(E2 SAV LH/RH pre-failure, oxygen no-dispatch, or W&B brake/gear removal, "
-               "plus Airbus red-tier >5 exceedances). Each is a potential unscheduled "
+               "(E2 SAV LH/RH pre-failure, oxygen no-dispatch, W&B brake/gear removal, "
+               "plus Airbus red-tier >5 exceedances and A320 starter-valve pre-failure). "
+               "Each is a potential unscheduled "
                "removal / AOG caught before failure — a candidate save, not an asserted one.")
 
 st.caption(
-    "🛡️ **Commercial impact** — each flagged aircraft is a potential unscheduled "
+    "**Commercial impact** — each flagged aircraft is a potential unscheduled "
     "removal or AOG caught predictively before in-service failure this period. "
-    "Specific tails are listed in the Immediate Actions banner below."
+    "Specific tails are listed in the Immediate Actions banner below. "
+    f"Separately, {fuel_advisory_n} aircraft are on a fuel cruise-burn advisory "
+    "(>10% above their own baseline) — a monitor-tier heuristic confounded by "
+    "weight/altitude/wind, not an asserted predictive catch."
 )
 
 st.divider()
@@ -357,7 +454,7 @@ for tail, engs in sorted(sav_a320_alerts.items()):
     )
 
 if immediate_items:
-    st.error("**🚨 Immediate Actions Required**\n\n" + "\n\n".join(f"- {x}" for x in immediate_items))
+    st.error("**Immediate Actions Required**\n\n" + "\n\n".join(f"- {x}" for x in immediate_items))
 
 # Watch list
 watch_items = []
@@ -368,15 +465,18 @@ for msn in all_e2:
     if foqa_exceedances.get(msn, 0) > 0:
         n = foqa_exceedances[msn]
         watch_items.append(f"**{_dnm(msn)}** — FOQA: {n} exceedance event(s) this period")
+    if fuel_alert.get(msn) in (1, 2):
+        fuel_icon = "Critical" if fuel_alert.get(msn) == 2 else "Monitor"
+        watch_items.append(f"{fuel_icon} **{_dnm(msn)}** — Fuel: +{fuel_pct.get(msn, 0):.0f}% vs own cruise-burn baseline (advisory — monitor engine degradation, ATA 73/76)")
 
 if watch_items:
-    st.warning("**⚠️ Monitor Closely**\n\n" + "\n\n".join(f"- {x}" for x in watch_items))
+    st.warning("**Monitor Closely**\n\n" + "\n\n".join(f"- {x}" for x in watch_items))
 
 if not immediate_items and not watch_items:
-    st.success(f"✅ No critical alerts in the last {days_back} days across all monitored systems.")
+    st.success(f"No critical alerts in the last {days_back} days across all monitored systems.")
 
 # ── Upcoming Maintenance Forecast (Tier 3 — upcoming inspections) ─────────────
-st.subheader("📅 Oxygen Servicing Forecast")
+st.subheader(":material/query_stats: Oxygen Servicing Forecast")
 st.caption(
     f"Forward-looking oxygen servicing calendar. Projects each E2 aircraft's "
     f"days-to-amber from the median daily PSI drop (PSI/day) and the smoothed current pressure "
@@ -410,13 +510,13 @@ else:
             for r in _fc_rows
         ]
         st.warning(
-            f"**📅 Plan oxygen servicing within {FORECAST_HORIZON_DAYS} days** — the "
+            f"**Plan oxygen servicing within {FORECAST_HORIZON_DAYS} days** — the "
             f"following aircraft are forecast to cross the {PSI_AMBER} PSI amber "
             f"(no-dispatch) threshold:\n" + "\n".join(_lines)
         )
     elif _fc["n_evaluated"] > 0:
         st.success(
-            f"✅ No E2 aircraft forecast to cross the {PSI_AMBER} PSI amber threshold "
+            f"No E2 aircraft forecast to cross the {PSI_AMBER} PSI amber threshold "
             f"within the next {FORECAST_HORIZON_DAYS} days "
             f"({_fc['n_evaluated']} aircraft evaluated)."
         )
@@ -430,10 +530,10 @@ else:
 st.divider()
 
 # ── Fleet Health Matrix ───────────────────────────────────────────────────────
-st.subheader("E2 Fleet — Health Matrix")
+st.subheader(":material/grid_view: E2 Fleet — Health Matrix")
 st.caption(
     "Latest status per aircraft × system. "
-    "🔴 = alert/action required · 🟡 = monitor · 🟢 = normal · — = no data in period"
+    "Critical = alert/action required · Monitor = monitor · Normal = normal · — = no data in period"
 )
 
 if "E2" in fleet_filter and all_e2:
@@ -442,27 +542,30 @@ if "E2" in fleet_filter and all_e2:
         dn = _dnm(msn)
 
         # SAV LH
-        sav_lh_cell = "🔴" if sav_lh_alert.get(msn) == 1 else ("🟢" if msn in sav_lh_alert else "—")
+        sav_lh_cell = "Critical" if sav_lh_alert.get(msn) == 1 else ("Normal" if msn in sav_lh_alert else "—")
         # SAV RH
-        sav_rh_cell = "🔴" if sav_rh_alert.get(msn) == 1 else ("🟢" if msn in sav_rh_alert else "—")
+        sav_rh_cell = "Critical" if sav_rh_alert.get(msn) == 1 else ("Normal" if msn in sav_rh_alert else "—")
         # Oxygen
         oa = oxy_alert.get(msn)
-        oxy_cell = ("🔴" if oa == 2 else "🟡" if oa == 1 else ("🟢" if msn in oxy_alert else "—"))
+        oxy_cell = ("Critical" if oa == 2 else "Monitor" if oa == 1 else ("Normal" if msn in oxy_alert else "—"))
         psi_val = f"{oxy_psi[msn]:.0f}" if msn in oxy_psi else "—"
         # FOQA
         foqa_n = foqa_exceedances.get(msn, None)
-        foqa_cell = ("🔴" if foqa_n and foqa_n > 0 else ("🟢" if foqa_n == 0 else "—"))
+        foqa_cell = ("Critical" if foqa_n and foqa_n > 0 else ("Normal" if foqa_n == 0 else "—"))
         # Wheels & Brakes (ATA 32)
-        wnb_cell = "🔴" if wnb_alert.get(msn) == 1 else ("🟢" if msn in wnb_alert else "—")
+        wnb_cell = "Critical" if wnb_alert.get(msn) == 1 else ("Normal" if msn in wnb_alert else "—")
+        # Fuel (ATA 73/76) — cruise-burn degradation vs own baseline
+        fa = fuel_alert.get(msn)
+        fuel_cell = ("Critical" if fa == 2 else "Monitor" if fa == 1 else ("Normal" if msn in fuel_alert else "—"))
 
         # Overall worst
-        cells = [sav_lh_cell, sav_rh_cell, oxy_cell, foqa_cell, wnb_cell]
-        if "🔴" in cells:
-            worst = "🔴 Critical"
-        elif "🟡" in cells:
-            worst = "🟡 Monitor"
-        elif "🟢" in cells:
-            worst = "🟢 Normal"
+        cells = [sav_lh_cell, sav_rh_cell, oxy_cell, foqa_cell, wnb_cell, fuel_cell]
+        if "Critical" in cells:
+            worst = "Critical"
+        elif "Monitor" in cells:
+            worst = "Monitor"
+        elif "Normal" in cells:
+            worst = "Normal"
         else:
             worst = "— No data"
 
@@ -475,23 +578,24 @@ if "E2" in fleet_filter and all_e2:
             "Oxygen": f"{oxy_cell} {psi_val} PSI".strip(),
             "FOQA": f"{foqa_cell} ({foqa_n})" if foqa_n is not None else foqa_cell,
             "W&B": wnb_cell,
+            "Fuel": f"{fuel_cell} +{fuel_pct[msn]:.0f}%" if msn in fuel_pct else fuel_cell,
         })
 
     if matrix_rows:
         df_matrix = pd.DataFrame(matrix_rows).sort_values(
             "Overall",
-            key=lambda s: s.map({"🔴 Critical": 0, "🟡 Monitor": 1, "🟢 Normal": 2, "— No data": 3}),
+            key=lambda s: s.map({"Critical": 0, "Monitor": 1, "Normal": 2, "— No data": 3}),
         )
 
         def _color_matrix(row):
             o = row.get("Overall", "")
-            if "🔴" in o:
+            if "Critical" in o:
                 return ["background-color: rgba(239,68,68,0.12)"] * len(row)
-            elif "🟡" in o:
+            elif "Monitor" in o:
                 return ["background-color: rgba(245,158,11,0.10)"] * len(row)
             return [""] * len(row)
 
-        display_cols = ["Aircraft", "Overall", "SAV LH", "SAV RH", "Oxygen", "FOQA", "W&B"]
+        display_cols = ["Aircraft", "Overall", "SAV LH", "SAV RH", "Oxygen", "FOQA", "W&B", "Fuel"]
         st.dataframe(
             df_matrix[display_cols].style.apply(_color_matrix, axis=1),
             use_container_width=True,
@@ -507,7 +611,7 @@ for fleet_key, fleet_label in [("a320", "A320"), ("a330", "A330")]:
         continue
 
     st.divider()
-    st.subheader(f"{fleet_label} Fleet — FOQA Exceedance Summary")
+    st.subheader(f":material/warning: {fleet_label} Fleet — FOQA Exceedance Summary")
 
     ab_col = airbus_ac_col
     if ab_col is None or ab_col not in df_ab.columns:
@@ -528,6 +632,12 @@ for fleet_key, fleet_label in [("a320", "A320"), ("a330", "A330")]:
         .sort_values("Exceedances", ascending=False)
     )
     _n_total_ab = len(ab_counts)
+    # Full per-tail FOQA exceedance counts (before top-10 truncation) for the A320 matrix
+    if fleet_label == "A320":
+        _a320_foqa_counts = dict(zip(
+            ab_counts["Aircraft"].astype(str).str.strip(),
+            ab_counts["Exceedances"].astype(int),
+        ))
     ab_counts = ab_counts.head(10)
     if _n_total_ab > 10:
         st.caption(f"Showing top 10 of {_n_total_ab} aircraft by exceedance count.")
@@ -553,32 +663,140 @@ for fleet_key, fleet_label in [("a320", "A320"), ("a330", "A330")]:
     )
     st.plotly_chart(fig_ab, use_container_width=True)
 
-# ── Data freshness ────────────────────────────────────────────────────────────
-st.divider()
-with st.expander("Data freshness — last update per system"):
-    for label, df_key in [
-        ("SAV LH (E2)", "sav_lh"),
-        ("SAV RH (E2)", "sav_rh"),
-        ("SAV A320 — Eng 1", "sav_a320_e1"),
-        ("SAV A320 — Eng 2", "sav_a320_e2"),
-        ("Oxygen (E2)", "oxy"),
-        ("FOQA E2", "foqa"),
-        ("A320 FOQA", "a320"),
-        ("A330 FOQA", "a330"),
-        ("Wheels & Brakes (E2)", "wnb"),
-        ("Fuel (E2)", "fuel"),
-    ]:
-        df_chk = data.get(df_key, pd.DataFrame())
-        if df_chk.empty or "date" not in df_chk.columns:
-            reason = data_errors.get(df_key, "no rows after serial/date cleaning")
-            st.write(f"- **{label}**: ❌ no data — {reason}")
-            continue
-        latest_dt = df_chk["date"].max()
-        age = (pd.Timestamp.now() - latest_dt).days if pd.notna(latest_dt) else None
-        status = f"✅" if age is not None and age <= 2 else "⚠️"
-        st.write(
-            f"- **{label}**: {status} last record "
-            f"{latest_dt.strftime('%d-%b-%Y') if pd.notna(latest_dt) else '—'}"
-            + (f" ({age}d ago)" if age is not None else "")
-            + f" · {len(df_chk):,} rows"
+    # ── A320 Health Matrix (FOQA + SAV per tail) — A320 only ──────────────────
+    # A330 keeps the bar chart only (no SAV signal), avoiding a redundant re-present.
+    if fleet_label == "A320":
+        st.markdown("#### A320 Fleet — Health Matrix")
+        st.caption(
+            "Per-tail triage across the two monitored A320 systems. "
+            "Critical = alert/action required · Monitor = monitor · Normal = normal · — = no data. "
+            "FOQA Critical = >5 exceedance events · SAV Critical = predicted starter-valve pre-failure."
         )
+        hm_rows = []
+        # Anchor on the UNION of FOQA and SAV tails so a SAV-only pre-failure
+        # tail (no FOQA record in the window) still surfaces as Critical.
+        for _tail in sorted(set(_a320_foqa_counts) | sav_a320_known):
+            _tail_s = str(_tail).strip()
+            _n = _a320_foqa_counts.get(_tail_s)
+            # FOQA cell — reuse the file's >5 red / >0 amber / 0 green convention
+            # when a count exists; otherwise — (no false for a missing record).
+            if _n is not None:
+                foqa_cell = "Critical" if _n > 5 else ("Monitor" if _n > 0 else "Normal")
+                foqa_display = f"{foqa_cell} ({int(_n)})"
+            else:
+                foqa_cell = "—"
+                foqa_display = "—"
+            # SAV cell — alert / known-no-alert / no record (— never a false )
+            if _tail_s in sav_a320_alerts:
+                sav_cell = "Critical"
+            elif _tail_s in sav_a320_known:
+                sav_cell = "Normal"
+            else:
+                sav_cell = "—"
+
+            cells = [foqa_cell, sav_cell]
+            if "Critical" in cells:
+                worst = "Critical"
+            elif "Monitor" in cells:
+                worst = "Monitor"
+            elif "Normal" in cells:
+                worst = "Normal"
+            else:
+                worst = "— No data"
+
+            hm_rows.append({
+                "Aircraft": display_name(_tail_s, prefix_map),
+                "Overall": worst,
+                "FOQA": foqa_display,
+                "SAV": sav_cell,
+            })
+
+        if hm_rows:
+            df_hm = pd.DataFrame(hm_rows).sort_values(
+                "Overall",
+                key=lambda s: s.map(
+                    {"Critical": 0, "Monitor": 1, "Normal": 2, "— No data": 3}
+                ),
+            )
+            _n_hm = len(df_hm)
+            df_hm = df_hm.head(10)
+            if _n_hm > 10:
+                st.caption(f"Showing top 10 of {_n_hm} A320 aircraft by status.")
+
+            def _color_hm(row):
+                o = row.get("Overall", "")
+                if "Critical" in o:
+                    return ["background-color: rgba(239,68,68,0.12)"] * len(row)
+                elif "Monitor" in o:
+                    return ["background-color: rgba(245,158,11,0.10)"] * len(row)
+                return [""] * len(row)
+
+            st.dataframe(
+                df_hm.style.apply(_color_hm, axis=1),
+                use_container_width=True,
+                hide_index=True,
+            )
+        else:
+            st.info(
+                "No A320 aircraft available to build the health matrix in the selected window."
+            )
+
+# ── Pipeline health ───────────────────────────────────────────────────────────
+st.divider()
+st.subheader(":material/health_and_safety: Pipeline health")
+
+_now_utc = pd.Timestamp.now(tz="UTC")
+_health_rows = []
+n_total = len(PIPELINE_SOURCES)
+n_stale = 0
+for label, df_key, filename, producing_job in PIPELINE_SOURCES:
+    df_chk = data.get(df_key, pd.DataFrame())
+    mtime = get_file_mtime(filename)
+    if mtime is None:
+        age_h = None
+        status = "Unavailable"
+        refresh = "—"
+        n_stale += 1
+    else:
+        age_h = (_now_utc - mtime) / pd.Timedelta(hours=1)
+        refresh = f"{int(round(age_h))}h ago"
+        if age_h > 48:
+            status = "Stale"
+            n_stale += 1
+        elif age_h > 24:
+            status = "Aging"
+        else:
+            status = "Active"
+
+    if not df_chk.empty and "date" in df_chk.columns:
+        last_dt = df_chk["date"].max()
+        last_flight = last_dt.strftime("%d-%b-%Y") if pd.notna(last_dt) else "—"
+        rows = len(df_chk)
+    else:
+        last_flight = "—"
+        rows = 0
+
+    _health_rows.append({
+        "System": label,
+        "Status": status,
+        "Producing job": producing_job,
+        "Last refresh": refresh,   # Drive mtime age — is the job alive?
+        "Last flight": last_flight,  # last event date — secondary data-coverage context
+        "Rows": rows,
+    })
+
+if n_stale > 0:
+    st.warning(
+        f"{n_stale} of {n_total} data sources have not refreshed in 48h+ — "
+        "the producing job(s) may be stopped; predictions on the affected "
+        "pages may be outdated."
+    )
+else:
+    st.success("All data sources refreshed within 48h.")
+
+with st.expander("Data freshness — last refresh per system"):
+    st.dataframe(
+        pd.DataFrame(_health_rows),
+        use_container_width=True,
+        hide_index=True,
+    )

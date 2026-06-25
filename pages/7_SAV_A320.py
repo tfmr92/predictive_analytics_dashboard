@@ -13,21 +13,31 @@ import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
 
-from utils.drive_loader import load
+from utils.drive_loader import load, render_freshest_badge
 
 st.set_page_config(page_title="SAV A320 — Starter Air Valve", layout="wide")
 
-st.title("⚙️ Starter Air Valve — A320/A321")
+st.title(":material/settings: Starter Air Valve — A320/A321")
 st.markdown(
     "Engine-start health from QAR snapshots (LEAP-1A). A degrading starter air "
     "valve opens **slower**, holds **less supply pressure**, and the core "
     "accelerates **slower** — all visible before an inop start."
 )
 
+render_freshest_badge(
+    ["airbus_sav_eng1_report.parquet", "airbus_sav_eng2_report.parquet"],
+    label="A320 SAV report",
+)
+
 PRED_COL = "sav_failure_pred"
 PROB_COL = "sav_failure_prob"
 LABEL_COL = "pre_failure"
 AC_COL = "aircraft_id"
+
+# Days without a recorded engine start after which a pre-failure prediction is
+# treated as stale: an in-service A320 starts engines several times daily, so a
+# 30-day gap reliably means the aircraft is out of normal service.
+RECENCY_DAYS = 30
 
 # ── Data ──────────────────────────────────────────────────────────────────────
 @st.cache_data(ttl=300)
@@ -68,7 +78,7 @@ if _latest_date is not None and pd.notna(_latest_date):
 
 # ── Sidebar ───────────────────────────────────────────────────────────────────
 with st.sidebar:
-    st.header("Filters")
+    st.header(":material/insights: Filters")
     days_back = st.slider("Days of history", 30, 540, 180)
     only_alert = st.checkbox(
         f"Only aircraft with pre-failure history ({len(ALERT_HISTORY_ANY)})",
@@ -101,27 +111,73 @@ def _alert_tails(df: pd.DataFrame) -> list[str]:
     latest = df.sort_values("date").groupby(AC_COL).last()
     return sorted(latest.index[latest[PRED_COL].eq(1)].tolist())
 
+def _alert_tails_aged(df: pd.DataFrame) -> dict[str, int]:
+    """{tail: age_days} for tails whose latest start predicts pre-failure."""
+    if df.empty or PRED_COL not in df.columns:
+        return {}
+    latest = df.sort_values("date").groupby(AC_COL).last()
+    flagged = latest[latest[PRED_COL].eq(1)]
+    today = pd.Timestamp.now().normalize()
+    return {
+        str(tail): int((today - row["date"].normalize()).days)
+        for tail, row in flagged.iterrows()
+    }
+
 _e1_alerts = _alert_tails(df_e1_full)
 _e2_alerts = _alert_tails(df_e2_full)
 
 c1, c2, c3, c4 = st.columns(4)
 c1.metric("Aircraft monitored (Eng 1)", df_e1[AC_COL].nunique() if not df_e1.empty else 0)
-c2.metric("🔴 In alert — Eng 1", len(_e1_alerts))
+c2.metric("In alert — Eng 1", len(_e1_alerts))
 c3.metric("Aircraft monitored (Eng 2)", df_e2[AC_COL].nunique() if not df_e2.empty else 0)
-c4.metric("🔴 In alert — Eng 2", len(_e2_alerts))
+c4.metric("In alert — Eng 2", len(_e2_alerts))
 
-if _e1_alerts or _e2_alerts:
+_aged_e1 = _alert_tails_aged(df_e1_full)
+_aged_e2 = _alert_tails_aged(df_e2_full)
+_active_e1 = {t: a for t, a in _aged_e1.items() if a <= RECENCY_DAYS}
+_stale_e1 = {t: a for t, a in _aged_e1.items() if a > RECENCY_DAYS}
+_active_e2 = {t: a for t, a in _aged_e2.items() if a <= RECENCY_DAYS}
+_stale_e2 = {t: a for t, a in _aged_e2.items() if a > RECENCY_DAYS}
+
+def _fmt_active(tails: dict[str, int]) -> str:
+    return "\n- ".join(
+        f"{t} (last start {a}d ago) — inspect starter air valve (ATA 80)"
+        for t, a in sorted(tails.items())
+    )
+
+def _fmt_stale(tails: dict[str, int]) -> str:
+    return ", ".join(f"{t} (last start {a}d ago)" for t, a in sorted(tails.items()))
+
+_any_active = bool(_active_e1 or _active_e2)
+_any_stale = bool(_stale_e1 or _stale_e2)
+
+if _any_active:
     lines = []
-    if _e1_alerts:
-        lines.append("**Engine 1 pre-failure predicted:** " + ", ".join(_e1_alerts)
-                     + " — inspect starter air valve (ATA 80)")
-    if _e2_alerts:
-        lines.append("**Engine 2 pre-failure predicted:** " + ", ".join(_e2_alerts)
-                     + " — inspect starter air valve (ATA 80)")
-    st.error("🚨 Fleet safety triage\n\n" + "\n\n".join(lines))
-else:
-    st.success("✅ No SAV pre-failure predicted on the latest start across the A320 fleet.")
-st.caption("Fleet-wide alert — based on every aircraft's latest start; ignores the sidebar filter.")
+    if _active_e1:
+        lines.append("**Engine 1 pre-failure predicted:**\n- " + _fmt_active(_active_e1))
+    if _active_e2:
+        lines.append("**Engine 2 pre-failure predicted:**\n- " + _fmt_active(_active_e2))
+    st.error("Fleet safety triage\n\n" + "\n\n".join(lines))
+
+if _any_stale:
+    warn = []
+    if _stale_e1:
+        warn.append("**Engine 1:** " + _fmt_stale(_stale_e1))
+    if _stale_e2:
+        warn.append("**Engine 2:** " + _fmt_stale(_stale_e2))
+    st.warning(
+        "Flagged but no start in 30+ days — likely grounded/in maintenance, "
+        "verify aircraft status:\n\n" + "\n\n".join(warn)
+    )
+
+if not _any_active and not _any_stale:
+    st.success("No SAV pre-failure predicted on the latest start across the A320 fleet.")
+
+st.caption(
+    "Fleet-wide alert — based on every aircraft's latest start; ignores the sidebar "
+    "filter. Red = predicted pre-failure on a recent start; amber = stale prediction "
+    "(no start in 30+ days) pending aircraft-status verification."
+)
 
 st.divider()
 
@@ -164,7 +220,7 @@ def _trend_chart(df: pd.DataFrame, col: str, title: str, unit: str, bad_dir: str
     if len(df_plot) < 5:
         return None
     df_plot["_legend"] = df_plot[AC_COL].map(
-        lambda t: f"⚠ {t}" if t in alert_set else _FLEET_LABEL
+        lambda t: f"{t}" if t in alert_set else _FLEET_LABEL
     )
     alert_labels = sorted(l for l in df_plot["_legend"].unique() if l != _FLEET_LABEL)
     palette = px.colors.qualitative.Set1
@@ -196,7 +252,7 @@ def _trend_chart(df: pd.DataFrame, col: str, title: str, unit: str, bad_dir: str
     fig.update_layout(
         height=320, margin=dict(t=40, b=20, l=10, r=10),
         xaxis=dict(tickformat="%d-%b-%y"),
-        legend_title_text="Aircraft (⚠ = pre-failure history)",
+        legend_title_text="Aircraft (= pre-failure history)",
     )
     return fig
 
@@ -244,8 +300,9 @@ def _eda_histogram(stats: dict, title: str, unit: str, bad_dir: str) -> go.Figur
 
 
 # ── Tabs ──────────────────────────────────────────────────────────────────────
-tab_e1, tab_e2, tab_status, tab_eda = st.tabs(
-    ["Engine 1", "Engine 2", "Current Risk Status", "Threshold Analysis (EDA)"]
+tab_e1, tab_e2, tab_status, tab_eda, tab_rank = st.tabs(
+    [":material/settings: Engine 1", ":material/settings: Engine 2", ":material/health_and_safety: Current Risk Status", ":material/straighten: Threshold Analysis (EDA)",
+     ":material/leaderboard: Fleet Degradation Ranking"]
 )
 
 for tab, df, side_label, alert_set in [
@@ -258,7 +315,7 @@ for tab, df, side_label, alert_set in [
             continue
         if alert_set:
             st.caption(
-                "⚠ Aircraft with pre-failure history are individually colored; "
+                "Aircraft with pre-failure history are individually colored; "
                 "the rest of the fleet is shown in grey: " + ", ".join(sorted(alert_set))
             )
         rendered = 0
@@ -311,7 +368,7 @@ with tab_status:
             st.plotly_chart(fig_risk, use_container_width=True)
 
 with tab_eda:
-    st.subheader("What does a pre-failure start look like?")
+    st.subheader(":material/insights: What does a pre-failure start look like?")
     st.markdown(
         "Each start in the history is split by the model's prediction: **normal** "
         "(green) vs **predicted pre-failure** (red). A signal physically confirms "
@@ -342,7 +399,7 @@ with tab_eda:
                 "Median — normal": round(stats["median_normal"], 2),
                 "Median — pre-failure": round(stats["median_alert"], 2),
                 "Separation (% pre-failure beyond normal P75/P25)": f"{sep:.0%}",
-                "Confirms pre-failure?": "✅" if confirms else "⚠️ weak",
+                "Confirms pre-failure?": "" if confirms else "weak",
             })
             with plot_cols[n_plotted % 2]:
                 st.plotly_chart(_eda_histogram(stats, f"{signal_name} — {side_pick}", unit, bad_dir),
@@ -350,8 +407,134 @@ with tab_eda:
             n_plotted += 1
 
         if summary_rows:
-            st.subheader("Signal separation summary")
+            st.subheader(":material/analytics: Signal separation summary")
             st.dataframe(pd.DataFrame(summary_rows), use_container_width=True, hide_index=True)
         else:
             st.info("Not enough starts in both classes to run the analysis "
                     "(need ≥30 normal and ≥10 pre-failure starts per signal).")
+
+with tab_rank:
+    st.subheader(":material/leaderboard: Fleet degradation ranking")
+    st.markdown(
+        "Each aircraft's recent starts are scored against the fleet's own "
+        "**normal** start distribution, per confirming signal, and combined into a "
+        "composite degradation score. This early-warning ranking **complements** — "
+        "it does not replace — the binary Current Risk Status."
+    )
+    side_rank = st.radio("Engine", ["Engine 1", "Engine 2"], horizontal=True, key="ab_rank")
+    df_rank = df_e1_full if side_rank == "Engine 1" else df_e2_full
+    alert_hist_rank = ALERT_HISTORY_E1 if side_rank == "Engine 1" else ALERT_HISTORY_E2
+
+    MIN_RANK_SIGNALS = 2
+
+    if df_rank.empty or PRED_COL not in df_rank.columns or AC_COL not in df_rank.columns:
+        st.info("Prediction column not available — cannot build the degradation ranking.")
+    else:
+        # (1) keep only signals whose predicted-pre-failure median confirms degradation
+        confirming = {}  # signal_name -> (col, bad_dir, stats)
+        for signal_name, (col, _unit, _caption, bad_dir) in SIGNALS.items():
+            stats = _signal_eda(df_rank, col, PRED_COL)
+            if stats is None:
+                continue
+            if bad_dir == "up" and stats["median_alert"] > stats["p75_normal"]:
+                confirming[signal_name] = (col, bad_dir, stats)
+            elif bad_dir == "down" and stats["median_alert"] < stats["p25_normal"]:
+                confirming[signal_name] = (col, bad_dir, stats)
+
+        if not confirming:
+            st.info(
+                "No signal currently confirms pre-failure (no signal's predicted "
+                "median sits beyond the normal P75/P25), so a fleet degradation "
+                "ranking would not be meaningful yet."
+            )
+        else:
+            # (2)+(3) per-aircraft directional degradation percentile per signal
+            signal_cols = list(confirming.keys())
+            rows = []
+            for tail, g in df_rank.sort_values("date").groupby(AC_COL):
+                cell = {"Aircraft": str(tail)}
+                for signal_name, (col, bad_dir, stats) in confirming.items():
+                    recent = g[col].dropna().tail(5)
+                    if len(recent) < 3:
+                        cell[signal_name] = float("nan")
+                        continue
+                    val = float(recent.median())
+                    normal = stats["normal"]
+                    if bad_dir == "up":
+                        cell[signal_name] = float((normal < val).mean()) * 100
+                    else:
+                        cell[signal_name] = float((normal > val).mean()) * 100
+                rows.append(cell)
+
+            rank_df = pd.DataFrame(rows).set_index("Aircraft")
+
+            # (4) THE FIX: require >= MIN_RANK_SIGNALS non-null cells before the
+            # composite, so a single high signal can never top the ranking.
+            coverage = rank_df[signal_cols].notna().sum(axis=1)
+            eligible = rank_df[coverage >= MIN_RANK_SIGNALS].copy()
+            n_dropped = int((coverage < MIN_RANK_SIGNALS).sum())
+
+            if eligible.empty:
+                st.info(
+                    f"No aircraft has at least {MIN_RANK_SIGNALS} confirming signals "
+                    "with enough recent starts to compute a comparable composite score."
+                )
+            else:
+                eligible["_composite"] = eligible[signal_cols].mean(axis=1, skipna=True)
+                eligible = eligible.sort_values("_composite", ascending=False)
+
+                if n_dropped:
+                    st.caption(
+                        f"{n_dropped} aircraft excluded for thin coverage (fewer than "
+                        f"{MIN_RANK_SIGNALS} confirming signals with enough recent starts)."
+                    )
+
+                # (5) heatmap — rows = aircraft, cols = confirming signals, top 12
+                heat = eligible.head(12)
+                z = heat[signal_cols].values.tolist()
+                text = [
+                    ["" if pd.isna(v) else f"{round(v)}" for v in row]
+                    for row in z
+                ]
+                fig_heat = go.Figure(go.Heatmap(
+                    z=z,
+                    x=signal_cols,
+                    y=list(heat.index),
+                    zmin=0, zmax=100,
+                    colorscale="RdYlGn_r",
+                    text=text,
+                    texttemplate="%{text}",
+                    colorbar=dict(title="Degradation %"),
+                ))
+                fig_heat.update_layout(
+                    title=f"Degradation percentile vs normal starts — {side_rank} (top 12)",
+                    height=max(320, len(heat) * 34 + 120),
+                    margin=dict(l=10, r=10, t=50, b=10),
+                    yaxis=dict(autorange="reversed"),
+                )
+                st.plotly_chart(fig_heat, use_container_width=True)
+
+                # (6) ranked table tying the continuous score back to the binary model
+                table_rows = []
+                for tail, row in eligible.iterrows():
+                    vals = row[signal_cols]
+                    table_rows.append({
+                        "Aircraft": tail,
+                        "Composite degradation score": round(float(row["_composite"]), 1),
+                        "Signals with data": int(vals.notna().sum()),
+                        "Signals in red zone (≥75%)": int((vals >= 75).sum()),
+                        "Model alert": "yes" if tail in alert_hist_rank else "—",
+                    })
+                st.dataframe(
+                    pd.DataFrame(table_rows), use_container_width=True, hide_index=True
+                )
+
+                st.caption(
+                    "Continuous early-warning degradation comparison against the fleet's "
+                    "own normal start distribution. It **complements** (does not replace) "
+                    "the binary Current Risk Status, and is computed fleet-wide, ignoring "
+                    f"the sidebar filter. Aircraft with fewer than {MIN_RANK_SIGNALS} "
+                    "confirming signals with data are excluded to keep the composite "
+                    "comparable. This is a relative heuristic, not a model validated "
+                    "against confirmed SAV removals."
+                )

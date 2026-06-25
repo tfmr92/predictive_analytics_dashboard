@@ -9,16 +9,18 @@ import plotly.graph_objects as go
 import numpy as np
 import streamlit as st
 
-from utils.drive_loader import load, clean_df, make_prefix_map, display_name
+from utils.drive_loader import load, clean_df, make_prefix_map, display_name, render_freshest_badge
 
 st.set_page_config(page_title="Fuel Consumption", layout="wide")
 
-st.title("⛽ Fuel Consumption")
+st.title(":material/local_gas_station: Fuel Consumption")
 st.markdown(
     "Tracks fuel burned in each phase of flight. "
     "An **increasing trend during cruise** can indicate engine degradation, "
     "aerodynamic issues, or an inefficient flight plan."
 )
+
+render_freshest_badge(["e2_fuel_report.parquet"], label="Fuel report")
 
 # ── Data ────────────────────────────────────────────────────────
 df = load("e2_fuel_report.parquet")
@@ -43,7 +45,7 @@ def _dnm(msn) -> str:
 
 # ── Sidebar controls ────────────────────────────────────────────
 with st.sidebar:
-    st.header("Filters")
+    st.header(":material/insights: Filters")
     days_back = st.slider("Days of history", 30, 365, 120)
     all_ac = sorted(df[AC_COL].dropna().unique().tolist()) if AC_COL else []
     selected_ac = st.multiselect("Aircraft", options=all_ac, default=all_ac, format_func=_dnm)
@@ -87,33 +89,87 @@ for _c in all_burn_cols:
 if cruise_cols:
     df["_cruise_total"] = df[cruise_cols].sum(axis=1)
 
+# ── Shared cruise-burn baseline method (KPI c4 + Section 5 + Section 6) ─────────
+# One own-baseline calculation drives the headline KPI, the single-aircraft
+# degradation view (Section 5) and the watchlist (Section 6), so the headline
+# count and the MSNs named in the watchlist can never disagree.
+# Normalize the cruise-burn signal by cruise duration when available so route
+# length no longer confounds engine health (a longer cruise burns more fuel
+# regardless of engine condition); otherwise fall back to absolute kg.
+_USE_RATE = ("time_sec_cruise" in df.columns) and bool(cruise_cols)
+
+if _USE_RATE:
+    _dur_hr = pd.to_numeric(df["time_sec_cruise"], errors="coerce") / 3600.0
+    # Guarded: only where cruise duration is present and strictly positive.
+    df["_cruise_kg_per_hr"] = np.where(_dur_hr > 0, df["_cruise_total"] / _dur_hr, np.nan)
+    _METRIC = "_cruise_kg_per_hr"
+    _UNIT = "kg/h"
+    _Y_TITLE = "Cruise fuel rate (kg/h)"
+else:
+    _METRIC = "_cruise_total"
+    _UNIT = "kg"
+    _Y_TITLE = "Cruise fuel (kg)"
+
+_MIN_BASELINE_FLIGHTS = 5
+_AMBER_FACTOR = 1.05
+_RED_FACTOR = 1.10
+
+
+@st.cache_data(ttl=300)
+def _build_cruise_watchlist(df_in, metric, ac_col, min_flights, amber, red):
+    df_w = df_in.dropna(subset=["date", metric, ac_col]).copy()
+    rows = []
+    n_excluded = 0
+    for tail, g in df_w.groupby(ac_col):
+        g = g.sort_values("date")
+        n = len(g)
+        n_base = min(n, max(min_flights, int(np.ceil(n * 0.30))))
+        recent_n = min(min_flights, n)
+        # Temporal separation: the baseline (earliest n_base flights) and the recent
+        # window (last recent_n flights) must NOT overlap, otherwise a degrading tail
+        # leaks its recent flights into its own baseline and hides the rise.
+        if n < n_base + recent_n:
+            n_excluded += 1
+            continue
+        baseline = float(g[metric].iloc[:n_base].median())
+        if baseline <= 0:
+            n_excluded += 1
+            continue
+        recent_mean = float(g[metric].iloc[-recent_n:].mean())
+        pct_above = (recent_mean - baseline) / baseline * 100.0
+        if recent_mean > baseline * red:
+            status = ">+10%"
+        elif recent_mean > baseline * amber:
+            status = ">+5%"
+        else:
+            status = "OK"
+        rows.append({
+            "Aircraft": tail, "Status": status, "Recent": recent_mean,
+            "Baseline": baseline, "pct_above": pct_above, "Flights": n,
+        })
+    return pd.DataFrame(rows), n_excluded
+
+
+# Build the watchlist once, up front; both the headline KPI (c4) and Section 6
+# read this exact result, so they can never tell different stories.
+wl_all, _wl_excluded = pd.DataFrame(), 0
+if cruise_cols and AC_COL and "date" in df.columns:
+    wl_all, _wl_excluded = _build_cruise_watchlist(
+        df[["date", _METRIC, AC_COL]], _METRIC, AC_COL,
+        _MIN_BASELINE_FLIGHTS, _AMBER_FACTOR, _RED_FACTOR,
+    )
+
 # ── KPIs ───────────────────────────────────────────────────
 avg_cruise = df["_cruise_total"].mean() if cruise_cols else 0
 total_burn_cols = list(burn_cols.keys())
 avg_total = df[total_burn_cols].sum(axis=1).mean() if total_burn_cols else 0
 n_flights = len(df)
 
+# Headline count shares Section 6's own-baseline math: the red + amber tiers of
+# the same watchlist, so this number always matches the MSNs named there.
 n_rising = None
-if cruise_cols and AC_COL and "date" in df.columns:
-    rising = 0
-    counted = 0
-    for _, g in df.dropna(subset=["date", "_cruise_total"]).groupby(AC_COL):
-        g = g.sort_values("date")
-        if len(g) < 3:
-            continue
-        x = (g["date"] - g["date"].min()).dt.days.to_numpy(dtype=float)
-        y = g["_cruise_total"].to_numpy(dtype=float)
-        if x.max() == x.min():
-            continue
-        baseline = y.mean()
-        if baseline <= 0:
-            continue
-        slope = np.polyfit(x, y, 1)[0]
-        projected_rise = slope * (x.max() - x.min())
-        counted += 1
-        if projected_rise / baseline > 0.05:
-            rising += 1
-    n_rising = rising if counted else None
+if not wl_all.empty:
+    n_rising = int(wl_all["Status"].isin([">+10%", ">+5%"]).sum())
 
 c1, c2, c3, c4 = st.columns(4)
 c1.metric("Flights analysed", f"{n_flights:,}")
@@ -123,18 +179,18 @@ c4.metric(
     "Aircraft with rising cruise-burn trend (>5%)",
     f"{n_rising}" if n_rising is not None else "—",
     help=(
-        "Count of aircraft whose own cruise fuel burn shows a rising linear trend "
-        "(np.polyfit slope) projecting more than a 5% increase across the analysed "
-        "window, measured against each aircraft's own baseline mean. Unlike a "
-        "fleet-relative threshold, this only fires when a tail is actually trending "
-        "worse than its own history — an actionable pre-failure signal."
+        "Count of aircraft whose recent cruise burn sits more than 5% above their "
+        "OWN historical baseline — the red + amber tiers of the Section 6 Cruise-Burn "
+        "Watchlist. This uses the exact same own-baseline calculation as that "
+        "watchlist (not a separate trend fit), so the headline number always agrees "
+        "with the specific MSNs named there."
     ),
 )
 
 st.divider()
 
 # ── Section 1: Fuel distribution by phase ─────────────────────────────
-st.subheader("1. Where Is Fuel Burned?")
+st.subheader(":material/local_gas_station: 1. Where Is Fuel Burned?")
 st.caption("Average consumption per flight phase across the selected period.")
 
 if burn_cols:
@@ -173,7 +229,7 @@ if burn_cols:
 st.divider()
 
 # ── Section 2: Cruise efficiency per aircraft ──────────────────────────
-st.subheader("2. Cruise Efficiency per Aircraft")
+st.subheader(":material/local_gas_station: 2. Cruise Efficiency per Aircraft")
 st.caption(
     "Lower cruise consumption = more efficient engine. "
     "Red bars are more than 5% above the fleet average."
@@ -217,7 +273,7 @@ if cruise_cols and AC_COL:
 st.divider()
 
 # ── Section 3: Cruise fuel trend over time per aircraft ────────────────────
-st.subheader("3. Cruise Fuel Trend Over Time")
+st.subheader(":material/trending_up: 3. Cruise Fuel Trend Over Time")
 st.caption(
     "A rising line for a specific aircraft indicates increasing fuel consumption — "
     "a potential sign of engine degradation. Color = MSN."
@@ -252,7 +308,7 @@ if cruise_cols and AC_COL and "date" in df.columns:
 st.divider()
 
 # ── Section 4: Monthly fleet trend ───────────────────────────────────
-st.subheader("4. Fleet Monthly Fuel Trend")
+st.subheader(":material/trending_up: 4. Fleet Monthly Fuel Trend")
 st.caption("Rising fleet-wide trend may indicate deterioration across multiple aircraft.")
 
 if cruise_cols and "date" in df.columns:
@@ -290,21 +346,10 @@ if cruise_cols and "date" in df.columns:
 st.divider()
 
 # ── Section 5: Per-aircraft cruise-burn degradation vs own baseline ────────
-st.subheader("5. Per-Aircraft Cruise-Burn Degradation vs Own Baseline")
+st.subheader(":material/trending_up: 5. Per-Aircraft Cruise-Burn Degradation vs Own Baseline")
 
-# Normalize the cruise-burn signal by cruise duration so route length no longer
-# confounds engine health: a longer cruise burns more fuel regardless of engine
-# condition. We compare a cruise-specific burn RATE (kg/h) against each tail's own
-# baseline. If the cruise-duration column is absent, fall back to absolute kg.
-_USE_RATE = ("time_sec_cruise" in df.columns) and bool(cruise_cols)
-
+# Reads the shared _USE_RATE/_METRIC/_UNIT/_Y_TITLE method selected above the KPI row.
 if _USE_RATE:
-    _dur_hr = pd.to_numeric(df["time_sec_cruise"], errors="coerce") / 3600.0
-    # Guarded: only where cruise duration is present and strictly positive.
-    df["_cruise_kg_per_hr"] = np.where(_dur_hr > 0, df["_cruise_total"] / _dur_hr, np.nan)
-    _METRIC = "_cruise_kg_per_hr"
-    _UNIT = "kg/h"
-    _Y_TITLE = "Cruise fuel rate (kg/h)"
     st.caption(
         "Pick a tail to compare its per-flight cruise burn RATE against its OWN "
         "historical baseline (median of its earliest flights). The signal is "
@@ -314,9 +359,6 @@ if _USE_RATE:
         "of a fleet-relative threshold."
     )
 else:
-    _METRIC = "_cruise_total"
-    _UNIT = "kg"
-    _Y_TITLE = "Cruise fuel (kg)"
     st.caption(
         "Pick a tail to compare its per-flight cruise burn against its OWN historical "
         "baseline (median of its earliest flights). Amber band = 5–10% above baseline; "
@@ -325,10 +367,6 @@ else:
         "(time_sec_cruise) is unavailable, so this uses absolute cruise kg — longer "
         "routes may read high regardless of engine health."
     )
-
-_MIN_BASELINE_FLIGHTS = 5
-_AMBER_FACTOR = 1.05
-_RED_FACTOR = 1.10
 
 if not (cruise_cols and AC_COL and "date" in df.columns):
     st.info("Per-aircraft baseline analysis requires cruise fuel, aircraft and date columns.")
@@ -439,3 +477,71 @@ else:
                         f"MSN {chosen} is within tolerance — last {recent_n} flights are "
                         f"{pct_above:+.1f}% vs its own baseline of {baseline:.0f} {_UNIT}."
                     )
+
+st.divider()
+
+# ── Section 6: Cruise-Burn Watchlist — Aircraft Above Their Own Baseline ────
+st.subheader(":material/visibility: 6. Cruise-Burn Watchlist — Aircraft Above Their Own Baseline")
+st.caption(
+    "Ranks tails by how far their recent cruise burn sits above their OWN historical "
+    "baseline (rate-normalized by cruise time when available). This is the fleet-level "
+    "companion to the single-aircraft view in Section 5 and a per-tail-baseline "
+    "alternative to Section 2's fleet-relative ranking — it names the specific MSNs "
+    "behind the headline 'rising cruise-burn trend' count above. ADVISORY / monitor "
+    "signal only: cruise fuel burn is still confounded by weight, altitude and wind, "
+    "so it is NOT equivalent to a trained-model removal alert."
+)
+
+if not (cruise_cols and AC_COL and "date" in df.columns):
+    st.info("Cruise-burn watchlist requires cruise fuel, aircraft and date columns.")
+else:
+    # Reuse the watchlist already built above the KPI row — the same wl_all/_wl_excluded
+    # that backs the c4 headline count, so the two views never diverge.
+    wl, n_excluded = wl_all, _wl_excluded
+
+    if wl.empty:
+        st.success("No aircraft is currently burning above its own cruise baseline.")
+    else:
+        n_red = int((wl["Status"] == ">+10%").sum())
+        n_amber = int((wl["Status"] == ">+5%").sum())
+        wc1, wc2 = st.columns(2)
+        wc1.metric("Aircraft >10% above own baseline", n_red)
+        wc2.metric("Aircraft 5–10% above", n_amber)
+
+        wl_sorted = wl.sort_values("pct_above", ascending=False)
+        top = wl_sorted.head(12).reset_index(drop=True)
+
+        caption_parts = []
+        if len(wl_sorted) > 12:
+            caption_parts.append(f"Top 12 of {len(wl_sorted)} analysed")
+        if n_excluded:
+            caption_parts.append(f"{n_excluded} excluded for thin/overlapping history")
+        if caption_parts:
+            st.caption("; ".join(caption_parts) + ".")
+
+        disp = pd.DataFrame({
+            "Aircraft": top["Aircraft"].map(_dnm),
+            "Status": top["Status"],
+            f"Recent {_UNIT}": top["Recent"],
+            f"Own baseline {_UNIT}": top["Baseline"],
+            "% above": top["pct_above"],
+            "Flights": top["Flights"],
+        })
+
+        def _row_tint(row):
+            if str(row["Status"]).startswith("Critical"):
+                return ["background-color: rgba(239,68,68,0.15)"] * len(row)
+            if str(row["Status"]).startswith("Monitor"):
+                return ["background-color: rgba(251,191,36,0.15)"] * len(row)
+            return [""] * len(row)
+
+        styled = (
+            disp.style
+            .apply(_row_tint, axis=1)
+            .format({
+                f"Recent {_UNIT}": "{:.0f}",
+                f"Own baseline {_UNIT}": "{:.0f}",
+                "% above": "{:+.1f}%",
+            })
+        )
+        st.dataframe(styled, use_container_width=True, hide_index=True)

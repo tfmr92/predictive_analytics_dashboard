@@ -11,11 +11,10 @@ from utils.drive_loader import load
 
 st.set_page_config(
     page_title="Azul Fleet — Predictive Maintenance",
-    page_icon="✈️",
     layout="wide",
 )
 
-st.title("✈️ Azul Fleet — Predictive Maintenance")
+st.title(":material/flight: Azul Fleet — Predictive Maintenance")
 st.caption("E195-E2 · ATR 72 · A320 / A330 · Refreshed automatically · data lag ≤ 1 h")
 
 # ── Load data ──────────────────────────────────────────────────────────────────
@@ -56,19 +55,19 @@ elif not df_oxy.empty and "alert" in df_oxy.columns and oxy_ac_col:
     oxy_below_psi = int(df_oxy.sort_values("date").groupby(oxy_ac_col).last()["alert"].sum())
 
 c1, c2, c3, c4 = st.columns(4)
-c1.metric("🔴 SAV alerts — LH", sav_lh_alert,
+c1.metric("SAV alerts — LH", sav_lh_alert,
           help="Aircraft with predicted pre-failure on left starter valve (latest flight)")
-c2.metric("🔴 SAV alerts — RH", sav_rh_alert,
+c2.metric("SAV alerts — RH", sav_rh_alert,
           help="Aircraft with predicted pre-failure on right starter valve (latest flight)")
-c3.metric("⚠️ Hard landings (W&B)", wnb_hard,
+c3.metric("Hard landings (W&B)", wnb_hard,
           help="Total landings above 1.4 g in the loaded dataset")
-c4.metric("💨 Oxy below threshold", oxy_below_psi,
+c4.metric("Oxy below threshold", oxy_below_psi,
           help="Aircraft with latest pressure reading < 1800 PSI")
 
 st.divider()
 
 # ── Mini trend charts ──────────────────────────────────────────────────────────
-st.subheader("Fleet Trends")
+st.subheader(":material/trending_up: Fleet Trends")
 left, right = st.columns(2)
 
 # SAV LH — weekly alert rate
