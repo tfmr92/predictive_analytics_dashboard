@@ -514,6 +514,46 @@ def _driver_heatmap(df: pd.DataFrame, side: str) -> go.Figure | None:
     return fig
 
 
+# ── MCC-friendly strip/dot distribution (replaces box plots) ──────────────────
+def _strip_distribution(rest: pd.Series, high: pd.Series, title: str, unit: str,
+                        bad_dir: str, ref: float) -> go.Figure:
+    """Dot/strip distribution: each aircraft is one jittered point, Rest (green)
+    vs High risk (red), with a median bar per group and the confirmation-threshold
+    line. 'The red dots sit higher' is readable at a glance — no quartiles or
+    whiskers to interpret (built for MCC operators, not just statisticians)."""
+    rng = np.random.default_rng(42)
+    fig = go.Figure()
+    for vals, name, color, base in [
+        (rest, "Rest of fleet", "#22c55e", 0.0),
+        (high, "High risk", "#ef4444", 1.0),
+    ]:
+        if len(vals) == 0:
+            continue
+        x = base + rng.uniform(-0.12, 0.12, size=len(vals))
+        fig.add_trace(go.Scatter(
+            x=x, y=vals, mode="markers", name=name,
+            marker=dict(color=color, size=10, opacity=0.75,
+                        line=dict(width=0.5, color="white")),
+            hovertemplate=f"{name}<br>%{{y:.2f}} {unit}<extra></extra>",
+        ))
+        med = float(vals.median())
+        fig.add_shape(type="line", x0=base - 0.2, x1=base + 0.2, y0=med, y1=med,
+                      line=dict(color=color, width=3))
+        fig.add_annotation(x=base, y=med, text=f"median {med:.2f}", showarrow=False,
+                           yshift=12, font=dict(size=11, color=color))
+    fig.add_hline(y=ref, line_dash="dot", line_color="#f59e0b",
+                  annotation_text=("Rest P75" if bad_dir == "up" else "Rest P25"),
+                  annotation_position="top left")
+    fig.update_layout(
+        title=f"{title} ({unit})", height=320, showlegend=False,
+        margin=dict(t=40, b=10, l=10, r=10),
+        xaxis=dict(tickvals=[0, 1], ticktext=["Rest of fleet", "High risk"],
+                   range=[-0.5, 1.5]),
+        yaxis_title=unit,
+    )
+    return fig
+
+
 # ── Confirmed Failures (ACARS-validated ground truth) helper ──────────────────
 _CONFIRMED_TABLE = "e2_sav_confirmed_failures"
 _DB_URI = os.environ.get(
@@ -622,12 +662,15 @@ for tab, df_side, side in [(tab_lh, df_lh_f, "LH"), (tab_rh, df_rh_f, "RH")]:
                     color_discrete_map=_TIER_COLOR,
                     hover_name="Display",
                     category_orders={"tier": ["High", "Watch", "Normal"]},
+                    trendline="ols", trendline_scope="overall",
+                    trendline_color_override="black",
                     labels={col: f"{label} ({unit})",
                             "sav_transient_prob": "Pre-failure probability",
                             "tier": "Tier"},
                 )
                 fig_sc.add_hline(y=_HIGH, line_dash="dash", line_color="#dc2626")
-                fig_sc.update_traces(marker=dict(size=9, line=dict(width=0.5, color="white")))
+                fig_sc.update_traces(selector=dict(mode="markers"),
+                                     marker=dict(size=9, line=dict(width=0.5, color="white")))
                 fig_sc.update_layout(
                     height=330, margin=dict(t=30, b=10, l=10, r=10),
                     yaxis=dict(range=[0, 1], tickformat=".0%"),
@@ -644,10 +687,10 @@ for tab, df_side, side in [(tab_lh, df_lh_f, "LH"), (tab_rh, df_rh_f, "RH")]:
 with tab_eda:
     st.subheader(":material/analytics: Why is the model flagging this aircraft?")
     st.markdown(
-        "Two complementary views of the *why*: a **per-aircraft driver breakdown** "
-        "(how degraded each signal is vs the fleet) and a **distribution split** "
-        "between the high-risk and the rest of the fleet — the same pre-failure EDA "
-        "methodology used across the platform, applied to the transient drivers."
+        "Three point-based views of the *why* — no box-plot quartiles to read: a "
+        "**probability-vs-signal scatter** (does the score rise with the physical "
+        "degradation?), a **per-aircraft driver breakdown**, and a **dot-plot "
+        "distribution** comparing high-risk aircraft against the rest of the fleet."
     )
 
     side_pick = st.radio("Engine side", ["LH", "RH"], horizontal=True, key="eda_side")
@@ -656,6 +699,53 @@ with tab_eda:
     if df_eda.empty or "sav_transient_prob" not in df_eda.columns:
         st.info("No probability data available — cannot run the analysis.")
     else:
+        # ── (0) Probability validation — does the score track the physics? ────
+        st.markdown("**Does the probability track the physics?**")
+        prob_sigs = _present_signals(df_eda)
+        if prob_sigs:
+            label_map = {f"{n} ({u})": (n, c, u, bd) for n, c, u, bd, _cap in prob_sigs}
+            labels = list(label_map.keys())
+            default_idx = next((i for i, (n, c, *_) in enumerate(prob_sigs)
+                                if c == "ss_osc_std"), 0)
+            pick_lbl = st.selectbox("Signal to plot against probability", labels,
+                                    index=default_idx, key="eda_validate_sig")
+            sn, sc_, su, sd = label_map[pick_lbl]
+            dv = df_eda.dropna(subset=[sc_, "sav_transient_prob"]).copy()
+            if len(dv) >= 5:
+                dv["tier"] = dv["sav_transient_prob"].map(_tier)
+                dv["Display"] = dv["ac_sn"].map(_dnm)
+                fig_v = px.scatter(
+                    dv, x=sc_, y="sav_transient_prob", color="tier",
+                    color_discrete_map=_TIER_COLOR, hover_name="Display",
+                    category_orders={"tier": ["High", "Watch", "Normal"]},
+                    trendline="ols", trendline_scope="overall",
+                    trendline_color_override="black",
+                    labels={sc_: pick_lbl,
+                            "sav_transient_prob": "Pre-failure probability",
+                            "tier": "Tier"},
+                )
+                fig_v.add_hline(y=_HIGH, line_dash="dash", line_color="#dc2626",
+                                annotation_text="High", annotation_position="bottom right")
+                fig_v.update_traces(selector=dict(mode="markers"),
+                                    marker=dict(size=11, line=dict(width=0.5, color="white")))
+                fig_v.update_layout(height=400, margin=dict(t=20, b=10, l=10, r=10),
+                                    yaxis=dict(range=[0, 1], tickformat=".0%"),
+                                    legend=dict(orientation="h", y=1.1))
+                st.plotly_chart(fig_v, use_container_width=True)
+                corr = dv[sc_].corr(dv["sav_transient_prob"], method="spearman")
+                worse = "higher" if sd == "up" else "lower"
+                st.caption(
+                    f"Each dot is one aircraft ({side_pick}). The black line is the "
+                    f"overall trend and the Spearman correlation = **{corr:+.2f}**. The "
+                    f"score is consistent when probability **rises** as **{sn}** worsens "
+                    f"({worse} = more degraded) — the cloud should slope up toward the "
+                    "red High line. Dots are colored by recommended-action tier."
+                )
+            else:
+                st.info("Not enough aircraft with this signal to plot.")
+
+        st.divider()
+
         # ── (a) Per-aircraft driver breakdown ─────────────────────────────────
         pct, sigs = _driver_percentiles(df_eda)
         ranked = (
@@ -713,6 +803,11 @@ with tab_eda:
 
         # ── (b) Distribution split: high-risk vs rest ─────────────────────────
         st.markdown("**High-risk vs rest-of-fleet — signal distributions**")
+        st.caption(
+            "Each dot is one aircraft; the thick bar is the group median. When the "
+            "red (high-risk) cloud sits above the green (rest) cloud and past the "
+            "amber threshold line, the signal physically confirms the model."
+        )
         alert_mask = _is_alert(df_eda)
         high = df_eda[alert_mask]
         rest = df_eda[~alert_mask]
@@ -749,15 +844,7 @@ with tab_eda:
                     "Separation": f"{sep:.0%}",
                     "Confirms?": "" if confirms else "weak",
                 })
-                fig_b = go.Figure()
-                fig_b.add_trace(go.Box(y=r, name="Rest", marker_color="#22c55e",
-                                       boxpoints="all", jitter=0.4, pointpos=0))
-                fig_b.add_trace(go.Box(y=h, name="High risk", marker_color="#ef4444",
-                                       boxpoints="all", jitter=0.4, pointpos=0))
-                fig_b.update_layout(
-                    title=f"{name} ({unit})", height=300,
-                    margin=dict(t=40, b=10, l=10, r=10), showlegend=False,
-                )
+                fig_b = _strip_distribution(r, h, name, unit, bad_dir, ref)
                 with plot_cols[i % 2]:
                     st.plotly_chart(fig_b, use_container_width=True)
 
