@@ -131,6 +131,27 @@ df_lh = _normalize(df_lh)
 df_rh = _normalize(df_rh)
 
 
+@st.cache_data(ttl=300)
+def _load_flights(filename: str) -> pd.DataFrame:
+    """Per-flight transient features (one row per start) for the parameter trends."""
+    df = load(filename)
+    if df.empty:
+        return df
+    if "date" in df.columns:
+        df["date"] = pd.to_datetime(df["date"], errors="coerce")
+    if "flight_dt" in df.columns:
+        df["flight_dt"] = pd.to_datetime(df["flight_dt"], errors="coerce")
+    if "ac_sn" in df.columns:
+        df["ac_sn"] = (
+            df["ac_sn"].astype(str).str.strip().str.replace(r"\.0$", "", regex=True)
+        )
+    return df.dropna(subset=["date"]) if "date" in df.columns else df
+
+
+df_lh_flights = _load_flights("e2_sav_transient_lh_flights.parquet")
+df_rh_flights = _load_flights("e2_sav_transient_rh_flights.parquet")
+
+
 def _dnm(msn) -> str:
     return display_name(str(msn), _prefix_map)
 
@@ -272,6 +293,10 @@ def _action_of(assess: dict, ac_sn: str) -> str:
 
 assess_lh = _action_assessment(df_lh)
 assess_rh = _action_assessment(df_rh)
+
+# aircraft at alert level per side (drives per-aircraft hue in trends/separation)
+alert_lh = set(df_lh.loc[_is_alert(df_lh), "ac_sn"]) if not df_lh.empty else set()
+alert_rh = set(df_rh.loc[_is_alert(df_rh), "ac_sn"]) if not df_rh.empty else set()
 
 # ── Data freshness ────────────────────────────────────────────────────────────
 render_freshest_badge(
@@ -602,6 +627,55 @@ def _separation_scatter(df_side: pd.DataFrame, alert_set: set) -> go.Figure | No
     return fig
 
 
+# ── Per-parameter trend over time (per-flight transient history) ───────────────
+def _param_trend(dff: pd.DataFrame, col: str, unit: str, bad_dir: str, title: str,
+                 alert_set: set) -> go.Figure | None:
+    """Time trend for one parameter: x = date, y = value. One line per aircraft in
+    alert (its own color), the healthy fleet as grey points, and the healthy-fleet
+    degradation band (P90 up / P10 down) shaded."""
+    d = dff.dropna(subset=[col, "date"]).copy()
+    if len(d) < 5:
+        return None
+    healthy = d[~d["ac_sn"].isin(alert_set)]
+    fig = go.Figure()
+    if len(healthy) >= 5:
+        if bad_dir == "up":
+            p = float(healthy[col].quantile(0.90))
+            fig.add_hrect(y0=p, y1=float(d[col].max()) * 1.05, fillcolor="red", opacity=0.06,
+                          annotation_text="degradation zone (healthy P90)",
+                          annotation_position="top left")
+        else:
+            p = float(healthy[col].quantile(0.10))
+            fig.add_hrect(y0=float(d[col].min()) * 0.95, y1=p, fillcolor="red", opacity=0.06,
+                          annotation_text="degradation zone (healthy P10)",
+                          annotation_position="bottom left")
+    if not healthy.empty:
+        fig.add_trace(go.Scatter(
+            x=healthy["date"], y=healthy[col], mode="markers", name="Fleet (no alert)",
+            marker=dict(color="#cbd5e1", size=4, opacity=0.45),
+            hovertext=healthy["ac_sn"].map(_dnm),
+            hovertemplate="%{hovertext}<br>%{x|%d-%b}<br>%{y:.2f} " + unit + "<extra></extra>",
+        ))
+    palette = px.colors.qualitative.Dark24
+    for i, ac in enumerate(sorted(alert_set)):
+        sub = d[d["ac_sn"] == ac].sort_values("date")
+        if sub.empty:
+            continue
+        fig.add_trace(go.Scatter(
+            x=sub["date"], y=sub[col], mode="lines+markers", name=_dnm(ac),
+            marker=dict(color=palette[i % len(palette)], size=6),
+            line=dict(color=palette[i % len(palette)], width=2),
+            hovertemplate=f"<b>{_dnm(ac)}</b><br>%{{x|%d-%b}}<br>%{{y:.2f}} {unit}<extra></extra>",
+        ))
+    fig.update_layout(
+        title=f"{title} ({unit})", height=300,
+        margin=dict(t=40, b=10, l=10, r=10),
+        xaxis=dict(tickformat="%d-%b"), yaxis_title=unit,
+        legend=dict(orientation="h", y=-0.25, font=dict(size=9)),
+    )
+    return fig
+
+
 # ── Confirmed Failures (ACARS-validated ground truth) helper ──────────────────
 _CONFIRMED_TABLE = "e2_sav_confirmed_failures"
 _DB_URI = os.environ.get(
@@ -676,7 +750,10 @@ with tab_rank:
     )
 
 # ── Per-engine driver views ───────────────────────────────────────────────────
-for tab, df_side, side in [(tab_lh, df_lh_f, "LH"), (tab_rh, df_rh_f, "RH")]:
+for tab, df_side, side, df_flights, alert_side in [
+    (tab_lh, df_lh_f, "LH", df_lh_flights, alert_lh),
+    (tab_rh, df_rh_f, "RH", df_rh_flights, alert_rh),
+]:
     with tab:
         if df_side.empty or "sav_transient_prob" not in df_side.columns:
             st.info(f"No transient data available for {side}.")
@@ -730,6 +807,39 @@ for tab, df_side, side in [(tab_lh, df_lh_f, "LH"), (tab_rh, df_rh_f, "RH")]:
             f"{side}: {df_side['ac_sn'].nunique()} aircraft scored "
             f"(median of the last {int(df_side['n_flights'].median()) if 'n_flights' in df_side.columns and df_side['n_flights'].notna().any() else 'N'} starts each)."
         )
+
+        # ── Parameter trends over time (per-flight transient history) ─────────
+        st.divider()
+        st.markdown("**Parameter trends over time**")
+        if df_flights.empty:
+            st.info(
+                "Per-flight transient history not available yet. Run the "
+                "`save_sav_transient_report` job — its `export_transient_flights_op` "
+                "publishes one row per start."
+            )
+        else:
+            trend_sigs = [
+                (n, c, u, bd) for n, (c, u, bd, _cap) in SIGNALS.items()
+                if c in df_flights.columns and df_flights[c].notna().any()
+            ]
+            if not trend_sigs:
+                st.info("No trendable parameters in the per-flight export yet.")
+            else:
+                st.caption(
+                    "Each separate chart is one parameter over time. Lines are "
+                    "aircraft at alert level (own color); grey points are the healthy "
+                    "fleet; the shaded band is the healthy-fleet degradation zone "
+                    "(P90 / P10). Fleet-wide — ignores the sidebar filter."
+                )
+                tcols = st.columns(2)
+                rendered = 0
+                for n, c, u, bd in trend_sigs:
+                    fig_t = _param_trend(df_flights, c, u, bd, f"{n} — {side}", alert_side)
+                    if fig_t is None:
+                        continue
+                    with tcols[rendered % 2]:
+                        st.plotly_chart(fig_t, use_container_width=True)
+                    rendered += 1
 
 # ── Why this recommendation (EDA) ─────────────────────────────────────────────
 with tab_eda:
