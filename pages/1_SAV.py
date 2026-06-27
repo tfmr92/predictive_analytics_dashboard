@@ -514,42 +514,90 @@ def _driver_heatmap(df: pd.DataFrame, side: str) -> go.Figure | None:
     return fig
 
 
-# ── MCC-friendly strip/dot distribution (replaces box plots) ──────────────────
-def _strip_distribution(rest: pd.Series, high: pd.Series, title: str, unit: str,
-                        bad_dir: str, ref: float) -> go.Figure:
-    """Dot/strip distribution: each aircraft is one jittered point, Rest (green)
-    vs High risk (red), with a median bar per group and the confirmation-threshold
-    line. 'The red dots sit higher' is readable at a glance — no quartiles or
-    whiskers to interpret (built for MCC operators, not just statisticians)."""
-    rng = np.random.default_rng(42)
+# ── Fleet separation scatter (alert aircraft hued vs healthy fleet, grey) ──────
+def _separation_scatter(df_side: pd.DataFrame, alert_set: set) -> go.Figure | None:
+    """One scatter across ALL parameters. x = parameter; y = degradation percentile
+    vs the healthy (no-alert) fleet (0 = healthy-best, 100 = most degraded,
+    direction-corrected so higher = worse for every parameter). The healthy fleet
+    is grey; each aircraft at alert level keeps its own hue across parameters — so
+    the affected aircraft's separation from the healthy fleet is visible parameter
+    by parameter, in a single chart."""
+    sigs = _present_signals(df_side)
+    if not sigs or "ac_sn" not in df_side.columns:
+        return None
+    healthy = df_side[~df_side["ac_sn"].isin(alert_set)]
+    if len(healthy) < 5:
+        return None
+
+    params = [s[0] for s in sigs]
+    xpos = {name: i for i, name in enumerate(params)}
+    rng = np.random.default_rng(11)
+
+    def _pct(val, ref, bad_dir):
+        ref = ref.dropna()
+        if len(ref) == 0 or pd.isna(val):
+            return np.nan
+        if bad_dir == "up":
+            return float((ref < val).sum()) / len(ref) * 100.0
+        return float((ref > val).sum()) / len(ref) * 100.0
+
+    records = {}  # ac_sn -> [(x, y, param, raw, unit), ...]
+    for name, col, unit, bad_dir, _cap in sigs:
+        ref = pd.to_numeric(healthy[col], errors="coerce")
+        vals = pd.to_numeric(df_side[col], errors="coerce")
+        for ac, raw in zip(df_side["ac_sn"], vals):
+            p = _pct(raw, ref, bad_dir)
+            if pd.isna(p):
+                continue
+            records.setdefault(ac, []).append((xpos[name], p, name, float(raw), unit))
+
     fig = go.Figure()
-    for vals, name, color, base in [
-        (rest, "Rest of fleet", "#22c55e", 0.0),
-        (high, "High risk", "#ef4444", 1.0),
-    ]:
-        if len(vals) == 0:
-            continue
-        x = base + rng.uniform(-0.12, 0.12, size=len(vals))
-        fig.add_trace(go.Scatter(
-            x=x, y=vals, mode="markers", name=name,
-            marker=dict(color=color, size=10, opacity=0.75,
-                        line=dict(width=0.5, color="white")),
-            hovertemplate=f"{name}<br>%{{y:.2f}} {unit}<extra></extra>",
-        ))
-        med = float(vals.median())
-        fig.add_shape(type="line", x0=base - 0.2, x1=base + 0.2, y0=med, y1=med,
-                      line=dict(color=color, width=3))
-        fig.add_annotation(x=base, y=med, text=f"median {med:.2f}", showarrow=False,
-                           yshift=12, font=dict(size=11, color=color))
-    fig.add_hline(y=ref, line_dash="dot", line_color="#f59e0b",
-                  annotation_text=("Rest P75" if bad_dir == "up" else "Rest P25"),
+    fig.add_hrect(y0=75, y1=100, fillcolor="red", opacity=0.06,
+                  annotation_text="degradation zone (beyond healthy P75)",
                   annotation_position="top left")
+
+    gx, gy, gtext = [], [], []
+    for ac, pts in records.items():
+        if ac in alert_set:
+            continue
+        for xi, yi, pname, raw, unit in pts:
+            gx.append(xi + float(rng.uniform(-0.22, 0.22)))
+            gy.append(yi)
+            gtext.append(f"{_dnm(ac)}<br>{pname}: {raw:.2f} {unit}")
+    if gx:
+        fig.add_trace(go.Scatter(
+            x=gx, y=gy, mode="markers", name="Fleet (no alert)",
+            marker=dict(color="#cbd5e1", size=7, opacity=0.6),
+            hovertext=gtext,
+            hovertemplate="%{hovertext}<br>%{y:.0f} pctile<extra></extra>",
+        ))
+
+    palette = px.colors.qualitative.Dark24
+    alert_sorted = [a for a in df_side.sort_values(
+        "sav_transient_prob", ascending=False)["ac_sn"] if a in alert_set]
+    for i, ac in enumerate(alert_sorted):
+        pts = records.get(ac, [])
+        if not pts:
+            continue
+        xs, ys, txt = [], [], []
+        for xi, yi, pname, raw, unit in pts:
+            xs.append(xi + float(rng.uniform(-0.22, 0.22)))
+            ys.append(yi)
+            txt.append(f"{pname}: {raw:.2f} {unit}")
+        fig.add_trace(go.Scatter(
+            x=xs, y=ys, mode="markers", name=_dnm(ac),
+            marker=dict(color=palette[i % len(palette)], size=12,
+                        line=dict(width=1, color="white")),
+            hovertext=txt,
+            hovertemplate=f"<b>{_dnm(ac)}</b><br>%{{hovertext}}<br>%{{y:.0f}} pctile<extra></extra>",
+        ))
+
     fig.update_layout(
-        title=f"{title} ({unit})", height=320, showlegend=False,
-        margin=dict(t=40, b=10, l=10, r=10),
-        xaxis=dict(tickvals=[0, 1], ticktext=["Rest of fleet", "High risk"],
-                   range=[-0.5, 1.5]),
-        yaxis_title=unit,
+        height=460, margin=dict(t=30, b=60, l=10, r=10),
+        xaxis=dict(tickvals=list(xpos.values()), ticktext=params, tickangle=-25,
+                   range=[-0.5, len(params) - 0.5]),
+        yaxis=dict(title="Degradation percentile vs healthy fleet", range=[-3, 103]),
+        legend=dict(title="Aircraft in alert", orientation="v"),
     )
     return fig
 
@@ -689,8 +737,9 @@ with tab_eda:
     st.markdown(
         "Three point-based views of the *why* — no box-plot quartiles to read: a "
         "**probability-vs-signal scatter** (does the score rise with the physical "
-        "degradation?), a **per-aircraft driver breakdown**, and a **dot-plot "
-        "distribution** comparing high-risk aircraft against the rest of the fleet."
+        "degradation?), a **per-aircraft driver breakdown**, and a **fleet separation "
+        "scatter** where each alert aircraft is individually colored against the grey "
+        "healthy fleet, across every parameter."
     )
 
     side_pick = st.radio("Engine side", ["LH", "RH"], horizontal=True, key="eda_side")
@@ -801,62 +850,66 @@ with tab_eda:
 
         st.divider()
 
-        # ── (b) Distribution split: high-risk vs rest ─────────────────────────
-        st.markdown("**High-risk vs rest-of-fleet — signal distributions**")
-        st.caption(
-            "Each dot is one aircraft; the thick bar is the group median. When the "
-            "red (high-risk) cloud sits above the green (rest) cloud and past the "
-            "amber threshold line, the signal physically confirms the model."
-        )
-        alert_mask = _is_alert(df_eda)
-        high = df_eda[alert_mask]
-        rest = df_eda[~alert_mask]
-        if len(high) < 4 or len(rest) < 6:
-            st.info(
-                f"Not enough aircraft in both groups for a stable split "
-                f"(high={len(high)}, rest={len(rest)}). Need ≥4 high-risk and ≥6 rest."
-            )
+        # ── (b) Parameter separation — alert aircraft vs healthy fleet ─────────
+        st.markdown("**Parameter separation — alert aircraft vs healthy fleet**")
+        alert_eda = set(df_eda.loc[_is_alert(df_eda), "ac_sn"])
+        if not alert_eda:
+            st.info("No aircraft at alert level on this engine — nothing to separate.")
         else:
-            sigs_all = _present_signals(df_eda)
-            plot_cols = st.columns(2)
-            summary_rows = []
-            for i, (name, col, unit, bad_dir, _cap) in enumerate(sigs_all):
-                h = pd.to_numeric(high[col], errors="coerce").dropna()
-                r = pd.to_numeric(rest[col], errors="coerce").dropna()
-                if len(h) < 3 or len(r) < 4:
-                    continue
-                if bad_dir == "up":
-                    ref = float(r.quantile(0.75))
-                    sep = float((h > ref).mean())
-                    confirms = float(h.median()) > ref
-                    ref_label = "Rest P75"
-                else:
-                    ref = float(r.quantile(0.25))
-                    sep = float((h < ref).mean())
-                    confirms = float(h.median()) < ref
-                    ref_label = "Rest P25"
-                summary_rows.append({
-                    "Signal": name,
-                    "Direction": "↑ rising is bad" if bad_dir == "up" else "↓ falling is bad",
-                    "Median — high risk": round(float(h.median()), 2),
-                    "Median — rest": round(float(r.median()), 2),
-                    ref_label: round(ref, 2),
-                    "Separation": f"{sep:.0%}",
-                    "Confirms?": "" if confirms else "weak",
-                })
-                fig_b = _strip_distribution(r, h, name, unit, bad_dir, ref)
-                with plot_cols[i % 2]:
-                    st.plotly_chart(fig_b, use_container_width=True)
+            sep_fig = _separation_scatter(df_eda, alert_eda)
+            if sep_fig is None:
+                st.info("Not enough healthy-fleet aircraft to build the separation view.")
+            else:
+                st.plotly_chart(sep_fig, use_container_width=True)
+                st.caption(
+                    "Each dot is one aircraft on one parameter. The healthy (no-alert) "
+                    "fleet is grey; each aircraft at alert level keeps its own color "
+                    "across every parameter. Y is the degradation percentile vs the "
+                    "healthy fleet (direction-corrected, so higher = worse for every "
+                    "parameter). A colored aircraft sitting high — in the shaded zone "
+                    "beyond the healthy P75 — is separated from the healthy fleet on "
+                    "that parameter."
+                )
 
+            # quantified separation summary (alert aircraft vs healthy fleet)
+            sigs_all = _present_signals(df_eda)
+            high = df_eda[_is_alert(df_eda)]
+            rest = df_eda[~_is_alert(df_eda)]
+            summary_rows = []
+            if len(high) >= 3 and len(rest) >= 5:
+                for name, col, unit, bad_dir, _cap in sigs_all:
+                    h = pd.to_numeric(high[col], errors="coerce").dropna()
+                    r = pd.to_numeric(rest[col], errors="coerce").dropna()
+                    if len(h) < 3 or len(r) < 4:
+                        continue
+                    if bad_dir == "up":
+                        ref = float(r.quantile(0.75))
+                        sep = float((h > ref).mean())
+                        confirms = float(h.median()) > ref
+                        ref_label = "Healthy P75"
+                    else:
+                        ref = float(r.quantile(0.25))
+                        sep = float((h < ref).mean())
+                        confirms = float(h.median()) < ref
+                        ref_label = "Healthy P25"
+                    summary_rows.append({
+                        "Signal": name,
+                        "Direction": "↑ rising is bad" if bad_dir == "up" else "↓ falling is bad",
+                        "Median — alert": round(float(h.median()), 2),
+                        "Median — healthy": round(float(r.median()), 2),
+                        ref_label: round(ref, 2),
+                        "Separation": f"{sep:.0%}",
+                        "Confirms?": "" if confirms else "weak",
+                    })
             if summary_rows:
                 st.subheader(":material/analytics: Signal separation summary")
                 st.dataframe(pd.DataFrame(summary_rows), use_container_width=True, hide_index=True)
                 st.caption(
-                    "A signal *confirms* the high-risk call when the high-risk median "
-                    "sits beyond the rest-of-fleet P75 (P25 for falling signals). "
-                    "Confirming signals are the physical evidence behind the model — "
-                    "an aircraft flagged by the model **and** degraded on a confirming "
-                    "signal deserves priority inspection."
+                    "A signal *confirms* the call when the alert-aircraft median sits "
+                    "beyond the healthy-fleet P75 (P25 for falling signals). Confirming "
+                    "signals are the physical evidence behind the model — an aircraft "
+                    "flagged **and** degraded on a confirming signal deserves priority "
+                    "inspection."
                 )
 
 # ── Confirmed Failures (ACARS-validated ground truth) ─────────────────────────
