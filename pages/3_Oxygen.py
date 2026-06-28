@@ -80,7 +80,7 @@ with st.sidebar:
     )
     alert_filter = st.checkbox(
         alert_label, value=False,
-        help="Pre-select only aircraft with elevated daily leak rate or PSI below the cyan CAS threshold.",
+        help="Pre-select only aircraft with elevated per-flight leak rate or PSI below the cyan CAS threshold.",
     )
     default_ac = alerted_msns if (alert_filter and alerted_msns) else all_ac
     selected_ac = st.multiselect("Aircraft (MSN)", options=all_ac, default=default_ac)
@@ -226,7 +226,7 @@ if "psi" in df.columns and AC_COL:
     if alerted_in_view:
         st.info(
             f"**Elevated leak rate:** {', '.join(sorted(alerted_in_view))} — "
-            "review daily PSI drop trend and plan cylinder inspection."
+            "review per-flight PSI drop trend and plan cylinder inspection."
         )
 
 elif "delta_press" in df.columns and AC_COL:
@@ -242,7 +242,7 @@ st.subheader(":material/straighten: 2. Aircraft Status — Latest Reading vs. AM
 st.caption(
     "Most recent pressure reading per aircraft. "
     "Red bars require immediate maintenance before next departure. "
-    "Hover for average daily leak rate."
+    "Hover for average per-flight leak rate."
 )
 
 if "psi" in df.columns and AC_COL:
@@ -263,7 +263,7 @@ if "psi" in df.columns and AC_COL:
         latest_status["_hover"] = latest_status.apply(
             lambda r: (
                 f"{r[AC_COL]}: {r['psi']:.0f} PSI  |  "
-                f"Avg leak: {r.get('avg_leak', 0):.1f} PSI/day"
+                f"Avg leak: {r.get('avg_leak', 0):.1f} PSI/flight"
             ),
             axis=1,
         )
@@ -298,12 +298,15 @@ if "psi" in df.columns and AC_COL:
 
 st.divider()
 
-# ── Chart 3: Daily leak rate per aircraft vs fleet mean ───────────────────────
-st.subheader(":material/bar_chart: 3. Daily Leak Rate per Aircraft — vs. Fleet Mean")
+# ── Chart 3: Per-flight leak rate per aircraft — leak detection ───────────────
+st.subheader(":material/bar_chart: 3. PSI Drop per Flight per Aircraft — Leak Detection")
 st.caption(
-    "Average PSI drop per day for each aircraft over the selected period. "
-    "Aircraft above the fleet alert threshold (mean + 1σ) are highlighted in red — "
-    "these show a steeper pressure-loss curve and should be prioritised for cylinder inspection."
+    "Average PSI drop **per flight** for each aircraft over the selected period. "
+    "Two leak criteria are applied to the fleet distribution of these per-aircraft rates: "
+    "the classic **mean + 2σ** (amber line, requested) and a **robust median + 3·MAD** "
+    "(red line) that is resistant to a few extreme flights. Aircraft past the robust line "
+    "are flagged as **suspected leaks** and prioritised for cylinder inspection; those past "
+    "2σ only are statistical outliers to monitor."
 )
 
 if "delta_press" in df.columns and AC_COL:
@@ -314,37 +317,82 @@ if "delta_press" in df.columns and AC_COL:
         .reset_index()
         .sort_values("avg", ascending=False)
     )
+    # Fleet distribution of per-aircraft mean drop/flight — classic + robust.
     fleet_mean = leak_per_ac["avg"].mean()
     fleet_std  = leak_per_ac["avg"].std()
-    threshold  = fleet_mean + fleet_std
-    leak_per_ac["_color"] = leak_per_ac["avg"].apply(
-        lambda v: "#ef4444" if v > threshold else "#64748b"
-    )
+    fleet_med  = leak_per_ac["avg"].median()
+    fleet_mad  = (leak_per_ac["avg"] - fleet_med).abs().median()
+    thr_2sigma = fleet_mean + 2.0 * fleet_std
+    thr_robust = fleet_med + 3.0 * 1.4826 * fleet_mad   # robust ≈ 2σ, outlier-resistant
+
+    # Persistence: aircraft with sustained elevation (alert flights) from the report.
+    persistent = set()
+    if "alert" in df.columns:
+        persistent = set(
+            df[df["alert"] == True][AC_COL].dropna().unique().tolist()
+        )
+
+    def _leak_class(row):
+        ac, v = row[AC_COL], row["avg"]
+        if v > thr_robust:
+            return "Suspected leak" if ac in persistent else "Robust outlier"
+        if v > thr_2sigma:
+            return "2σ outlier"
+        return "Normal"
+
+    leak_per_ac["_class"] = leak_per_ac.apply(_leak_class, axis=1)
+    _class_color = {
+        "Suspected leak": "#ef4444",
+        "Robust outlier": "#f97316",
+        "2σ outlier":     "#f59e0b",
+        "Normal":         "#64748b",
+    }
+    leak_per_ac["_color"] = leak_per_ac["_class"].map(_class_color)
 
     fig_leak = go.Figure(go.Bar(
         y=leak_per_ac[AC_COL].astype(str),
         x=leak_per_ac["avg"],
         orientation="h",
         marker_color=leak_per_ac["_color"],
-        text=leak_per_ac["avg"].round(1).astype(str) + " PSI/day",
+        text=leak_per_ac["avg"].round(1).astype(str) + " PSI/flt",
         textposition="outside",
-        customdata=leak_per_ac["n_obs"],
-        hovertemplate="%{y}: %{x:.2f} PSI/day  (n=%{customdata} obs)<extra></extra>",
+        customdata=leak_per_ac[["n_obs", "_class"]].values,
+        hovertemplate="%{y}: %{x:.2f} PSI/flight  (n=%{customdata[0]} flights) — %{customdata[1]}<extra></extra>",
     ))
     fig_leak.add_vline(x=fleet_mean, line_dash="solid", line_color="#64748b",
                        annotation_text=f"Fleet mean ({fleet_mean:.1f})",
                        annotation_position="top right")
-    fig_leak.add_vline(x=threshold, line_dash="dash", line_color="#ef4444",
-                       annotation_text=f"Alert threshold ({threshold:.1f})",
+    fig_leak.add_vline(x=thr_2sigma, line_dash="dash", line_color="#f59e0b",
+                       annotation_text=f"mean + 2σ ({thr_2sigma:.1f})",
                        annotation_position="top right")
+    fig_leak.add_vline(x=thr_robust, line_dash="dot", line_color="#ef4444",
+                       annotation_text=f"median + 3·MAD ({thr_robust:.1f})",
+                       annotation_position="bottom right")
     fig_leak.update_layout(
-        title="Average daily PSI leak rate per aircraft",
-        xaxis_title="Avg PSI drop / day",
+        title="Average PSI drop per flight per aircraft",
+        xaxis_title="Avg PSI drop / flight",
         yaxis_title="MSN",
         height=max(320, len(leak_per_ac) * 34),
-        margin=dict(l=10, r=180, t=40, b=10),
+        margin=dict(l=10, r=190, t=40, b=10),
     )
     st.plotly_chart(fig_leak, use_container_width=True)
+
+    suspected = leak_per_ac[leak_per_ac["_class"] == "Suspected leak"]
+    if not suspected.empty:
+        names = ", ".join(suspected[AC_COL].astype(str).tolist())
+        st.error(
+            f"**Suspected leak(s):** {names} — per-flight drop above the robust threshold "
+            f"(median + 3·MAD = {thr_robust:.1f} PSI/flight) **and** a sustained elevation "
+            "trend. Schedule cylinder inspection."
+        )
+    else:
+        robust_only = leak_per_ac[leak_per_ac["_class"] == "Robust outlier"]
+        if not robust_only.empty:
+            names = ", ".join(robust_only[AC_COL].astype(str).tolist())
+            st.warning(
+                f"**Robust outlier(s) to monitor:** {names} — above the robust threshold "
+                "but without a sustained trend yet. Re-check on next readings."
+            )
 
 st.divider()
 
@@ -395,9 +443,10 @@ if "psi" in df.columns and "delta_press" in df.columns and AC_COL:
     st.subheader(":material/query_stats: 5. Dispatch Forecast — Days Until Threshold")
     st.caption(
         "Estimated days until each aircraft crosses the 1,155 PSI (cyan) or 845 PSI (amber) "
-        "threshold. Current PSI uses the median of the last 5 readings and the projection uses "
-        "the median daily PSI drop, requiring a minimum of 4 readings; the immediate below-845 "
-        "PSI alert is evaluated for every aircraft regardless."
+        "threshold. Current PSI uses the median of the last 5 readings. The per-flight drop is "
+        "converted to a **per-calendar-day depletion rate** (total PSI lost over the observed "
+        "span) for the date projection, requiring a minimum of 4 readings; the immediate "
+        "below-845 PSI alert is evaluated for every aircraft regardless."
     )
 
     MIN_FORECAST_FLIGHTS = 4
@@ -408,11 +457,15 @@ if "psi" in df.columns and "delta_press" in df.columns and AC_COL:
     for msn, grp in df.dropna(subset=["psi", "delta_press", AC_COL]).groupby(AC_COL):
         grp = grp.sort_values("date")
         current_psi = grp["psi"].tail(5).median()
-        daily_drop = grp["delta_press"].median()
+        drop_per_flight = grp["delta_press"].median()
+        # Per-calendar-day depletion rate derived from the per-flight drops:
+        # total PSI lost over the observed span (date-based, recharges excluded).
+        span_days  = max(1, (grp["date"].max() - grp["date"].min()).days)
+        daily_rate = grp["delta_press"].sum() / span_days
         enough_readings = len(grp) >= MIN_FORECAST_FLIGHTS
-        if enough_readings and daily_drop > 0:
-            days_to_cyan  = max(0, (current_psi - PSI_CYAN)  / daily_drop)
-            days_to_amber = max(0, (current_psi - PSI_AMBER) / daily_drop)
+        if enough_readings and daily_rate > 0:
+            days_to_cyan  = max(0, (current_psi - PSI_CYAN)  / daily_rate)
+            days_to_amber = max(0, (current_psi - PSI_AMBER) / daily_rate)
             est_amber_date = today + pd.Timedelta(days=days_to_amber)
             est_amber_str  = est_amber_date.strftime("%d-%b-%Y")
         else:
@@ -423,7 +476,8 @@ if "psi" in df.columns and "delta_press" in df.columns and AC_COL:
         forecast_rows.append({
             "MSN": msn,
             "Current PSI": round(current_psi),
-            "Median drop (PSI/day)": round(daily_drop, 2),
+            "Drop / flight (PSI)": round(drop_per_flight, 2),
+            "Drop / day (PSI)": round(daily_rate, 2),
             "Days → Cyan (1155)": "—" if days_to_cyan == float("inf") else int(days_to_cyan),
             "Days → Amber (845)": "—" if days_to_amber == float("inf") else int(days_to_amber),
             "Estimated date (845)": est_amber_str,
@@ -467,7 +521,7 @@ if "psi" in df.columns and "delta_press" in df.columns and AC_COL:
             )
 
         display_cols = [
-            "MSN", "Current PSI", "Median drop (PSI/day)",
+            "MSN", "Current PSI", "Drop / flight (PSI)", "Drop / day (PSI)",
             "Days → Cyan (1155)", "Days → Amber (845)",
             "Estimated date (845)", "Status",
         ]
@@ -506,7 +560,8 @@ st.divider()
 # ── Section 6: Life Analysis — PSI Drop Histogram + Weibull ──────────────────
 st.subheader(":material/air: 6. Life Analysis — Oxygen Charge Duration")
 st.caption(
-    "Left: distribution of PSI drops per flight (shows variance in daily consumption). "
+    "Left: distribution of PSI drops **per flight** across the fleet, with the two leak "
+    "criteria overlaid (mean + 2σ and robust median + 3·MAD). "
     "Right: Weibull model fitted on the days between consecutive recharge events — "
     "B10/B50 guide proactive maintenance scheduling."
 )
@@ -519,6 +574,11 @@ with col_hist:
         _drops = _drops[_drops["delta_press"] > 0]
         if not _drops.empty:
             _fleet_avg_drop = _drops["delta_press"].mean()
+            _fleet_std_drop = _drops["delta_press"].std()
+            _fleet_med_drop = _drops["delta_press"].median()
+            _fleet_mad_drop = (_drops["delta_press"] - _fleet_med_drop).abs().median()
+            _thr_2sigma = _fleet_avg_drop + 2.0 * _fleet_std_drop
+            _thr_robust = _fleet_med_drop + 3.0 * 1.4826 * _fleet_mad_drop
             fig_hist = px.histogram(
                 _drops, x="delta_press",
                 nbins=30,
@@ -527,9 +587,19 @@ with col_hist:
                 color_discrete_sequence=["#64748b"],
             )
             fig_hist.add_vline(
-                x=_fleet_avg_drop, line_dash="dash", line_color="#f59e0b",
-                annotation_text=f"Fleet avg ({_fleet_avg_drop:.1f} PSI/flt)",
+                x=_fleet_avg_drop, line_dash="solid", line_color="#64748b",
+                annotation_text=f"Mean ({_fleet_avg_drop:.1f})",
                 annotation_position="top right",
+            )
+            fig_hist.add_vline(
+                x=_thr_2sigma, line_dash="dash", line_color="#f59e0b",
+                annotation_text=f"+2σ ({_thr_2sigma:.1f})",
+                annotation_position="top right",
+            )
+            fig_hist.add_vline(
+                x=_thr_robust, line_dash="dot", line_color="#ef4444",
+                annotation_text=f"median+3·MAD ({_thr_robust:.1f})",
+                annotation_position="bottom right",
             )
             fig_hist.update_layout(height=340, showlegend=False)
             st.plotly_chart(fig_hist, use_container_width=True)
@@ -611,17 +681,22 @@ st.divider()
 st.subheader(":material/trending_down: 7. PSI Depletion Forecast — Uncertainty Cone")
 st.caption(
     "Projects each aircraft toward the 845 PSI no-dispatch limit using the **P25–P75 spread "
-    "of its own daily leak-rate distribution** — giving an *earliest / latest* crossing window "
-    "instead of a single point ETA. The shaded cone is an uncertainty **envelope**, NOT a 95% "
-    "confidence interval. Projection assumes no recharge."
+    "of its own per-flight drop distribution**, scaled to a per-day rate by the aircraft's "
+    "flights/day — giving an *earliest / latest* crossing window instead of a single point ETA. "
+    "The shaded cone is an uncertainty **envelope**, NOT a 95% confidence interval. "
+    "Projection assumes no recharge."
 )
 
-_MIN_LEAK_OBS = 6  # min positive daily-leak readings before quantiles are trustworthy
+_MIN_LEAK_OBS = 6  # min positive per-flight leak readings before quantiles are trustworthy
 
 
 @st.cache_data(ttl=300)
 def _build_depletion_cone(df_in, ac_col):
-    """Per-aircraft P25/P50/P75 leak-rate projection to the 845 PSI amber limit."""
+    """Per-aircraft P25/P50/P75 leak-rate projection to the 845 PSI amber limit.
+
+    Per-flight drop quantiles are scaled to a per-calendar-day rate (× flights/day)
+    so the projection is expressed in days.
+    """
     today = pd.Timestamp.now().normalize()
     out: dict = {}
     base = df_in.dropna(subset=["psi", "delta_press", "date", ac_col]).sort_values("date")
@@ -632,9 +707,12 @@ def _build_depletion_cone(df_in, ac_col):
         # Gate: enough positive-leak readings AND still above the amber limit.
         if len(leak) < _MIN_LEAK_OBS or not (current_psi > PSI_AMBER):
             continue
-        slow = float(leak.quantile(0.25))   # optimistic — gentlest leak
-        med  = float(leak.quantile(0.50))   # expected
-        fast = float(leak.quantile(0.75))   # pessimistic — steepest leak
+        # Convert per-flight drop quantiles to a per-day rate via the aircraft's cadence.
+        span_days = max(1, (grp["date"].max() - grp["date"].min()).days)
+        flights_per_day = len(grp) / span_days
+        slow = float(leak.quantile(0.25)) * flights_per_day   # optimistic — gentlest leak
+        med  = float(leak.quantile(0.50)) * flights_per_day   # expected
+        fast = float(leak.quantile(0.75)) * flights_per_day   # pessimistic — steepest leak
 
         def _days(rate):
             return max(0.0, (current_psi - PSI_AMBER) / rate) if rate > 0 else float("inf")
@@ -665,7 +743,7 @@ if _have_cols and not df.empty:
     if not cone:
         st.info(
             "No aircraft currently qualify for a depletion forecast — each needs at least "
-            f"{_MIN_LEAK_OBS} positive daily-leak readings and a current PSI above the "
+            f"{_MIN_LEAK_OBS} positive per-flight leak readings and a current PSI above the "
             f"{PSI_AMBER} PSI amber limit. Expand the history window or wait for more readings."
         )
     else:
@@ -759,8 +837,8 @@ if _have_cols and not df.empty:
         _forecast_msg = (
             f"MSN {sel_tail} forecast to cross the {PSI_AMBER} PSI no-dispatch threshold "
             f"between {earliest_date:%d-%b-%Y} and {latest_date:%d-%b-%Y} "
-            f"(expected {expected_date:%d-%b-%Y}), from the P25–P75 spread of its own daily "
-            "leak rate; projection assumes no recharge."
+            f"(expected {expected_date:%d-%b-%Y}), from the P25–P75 spread of its own per-flight "
+            "drop (scaled to per day); projection assumes no recharge."
         )
         if info["earliest_days"] <= 30:
             st.warning(_forecast_msg)
@@ -769,9 +847,9 @@ if _have_cols and not df.empty:
 
         st.caption(
             "The shaded cone is an **uncertainty envelope** built from the P25–P75 spread of "
-            "this aircraft's own daily leak-rate distribution — it is **not** a 95% confidence "
-            "interval. Earliest crossing follows the steepest (P75) leak, latest the gentlest "
-            "(P25); the expected line uses the median."
+            "this aircraft's own per-flight drop distribution (scaled to per day) — it is "
+            "**not** a 95% confidence interval. Earliest crossing follows the steepest (P75) "
+            "leak, latest the gentlest (P25); the expected line uses the median."
         )
 else:
     st.info(
