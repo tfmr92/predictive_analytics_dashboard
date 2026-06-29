@@ -28,55 +28,182 @@ render_freshest_badge(
 
 AC_COL = "tail_number"
 
-# Exceedance flags grouped by severity for triage
-_LIMIT_FLAGS = [
-    "vmo_exceeded", "mmo_exceeded", "vle_exceeded",
-    "egt_takeoff_exceeded", "egt_continuous_exceeded",
-    "n1_vib_limit_exc", "n2_vib_limit_exc", "tire_overspeed",
-]
-_ADVISORY_FLAGS = [
-    "n1_vib_advisory", "n2_vib_advisory", "n3_vib_advisory",
-    "oil_low_press_flag", "oil_high_press_flag", "oil_temp_high_flag", "oil_qty_low_flag",
+# ── Single exceedance-flag spec source ─────────────────────────────────────────
+# Binds EVERY ATA-05 flag emitted by airbus_foqa_compute_op._compute_flight to its
+# value column(s), per-fleet limit key (resolved against _FLEET_LIMITS — the one
+# limit source) and comparison direction. Severity, labels and the legacy
+# _LIMIT_FLAGS / _ADVISORY_FLAGS / _FLAG_LABELS structures all derive from here, so
+# there is no second parallel spec table to drift. value_cols=[] / limit_key=None
+# means "flagged without a number" (discrete flag or no stored value). Keep in sync
+# with the producer when flags are added/removed.
+_FLAG_SPEC = [
+    {"key": "vmo_exceeded",            "label": "VMO exceeded",             "severity": "Limit",    "value_cols": ["cas_max_kias"],                            "limit_key": "vmo_kias",          "direction": "up",   "phase": "In-flight"},
+    {"key": "mmo_exceeded",            "label": "MMO exceeded",             "severity": "Limit",    "value_cols": ["mach_max"],                                "limit_key": "mmo",               "direction": "up",   "phase": "In-flight"},
+    {"key": "vle_exceeded",            "label": "VLE (gear ext.) exceeded", "severity": "Limit",    "value_cols": [],                                          "limit_key": "vle_kias",          "direction": "up",   "phase": "Approach/Landing"},
+    {"key": "egt_takeoff_exceeded",    "label": "EGT takeoff limit",        "severity": "Limit",    "value_cols": ["egt1_max_takeoff_c", "egt2_max_takeoff_c"],"limit_key": "egt_takeoff_c",     "direction": "up",   "phase": "Takeoff"},
+    {"key": "egt_continuous_exceeded", "label": "EGT continuous limit",     "severity": "Limit",    "value_cols": ["egt1_max_c", "egt2_max_c"],                "limit_key": "egt_continuous_c",  "direction": "up",   "phase": "Climb/Cruise"},
+    {"key": "n1_vib_limit_exc",        "label": "N1 vibration limit",       "severity": "Limit",    "value_cols": ["n1_vib_max"],                              "limit_key": "n1_vib_limit",      "direction": "up",   "phase": "In-flight"},
+    {"key": "n2_vib_limit_exc",        "label": "N2 vibration limit",       "severity": "Limit",    "value_cols": ["n2_vib_max"],                              "limit_key": "n2_vib_limit",      "direction": "up",   "phase": "In-flight"},
+    {"key": "tire_overspeed",          "label": "Tire overspeed",           "severity": "Limit",    "value_cols": ["tire_speed_max_kt"],                       "limit_key": "max_tire_speed_kt", "direction": "up",   "phase": "Ground roll"},
+    {"key": "n1_vib_advisory",         "label": "N1 vibration advisory",    "severity": "Advisory", "value_cols": ["n1_vib_max"],                              "limit_key": "n1_vib_advisory",   "direction": "up",   "phase": "In-flight"},
+    {"key": "n2_vib_advisory",         "label": "N2 vibration advisory",    "severity": "Advisory", "value_cols": ["n2_vib_max"],                              "limit_key": "n2_vib_advisory",   "direction": "up",   "phase": "In-flight"},
+    {"key": "n3_vib_advisory",         "label": "N3 vibration advisory",    "severity": "Advisory", "value_cols": ["n3_vib_max"],                              "limit_key": None,                "direction": "up",   "phase": "In-flight"},
+    {"key": "oil_low_press_flag",      "label": "Oil pressure low",         "severity": "Advisory", "value_cols": ["oil_press_min_1_psi", "oil_press_min_2_psi"],"limit_key": "oil_press_low_psi", "direction": "down", "phase": "Engine running"},
+    {"key": "oil_high_press_flag",     "label": "Oil pressure high",        "severity": "Advisory", "value_cols": [],                                          "limit_key": "oil_press_high_psi","direction": "up",   "phase": "Engine running"},
+    {"key": "oil_temp_high_flag",      "label": "Oil temperature high",     "severity": "Advisory", "value_cols": [],                                          "limit_key": "oil_temp_high_c",   "direction": "up",   "phase": "Engine running"},
+    {"key": "oil_qty_low_flag",        "label": "Oil quantity low",         "severity": "Advisory", "value_cols": [],                                          "limit_key": "oil_qty_low_qt",    "direction": "down", "phase": "Engine running"},
+    {"key": "fmw_active",              "label": "FMW fault (ACMS)",         "severity": "Advisory", "value_cols": [],                                          "limit_key": None,                "direction": None,   "phase": "—"},
 ]
 
-_FLAG_LABELS = {
-    "vmo_exceeded": "VMO exceeded",
-    "mmo_exceeded": "MMO exceeded",
-    "vle_exceeded": "VLE (gear ext.) exceeded",
-    "egt_takeoff_exceeded": "EGT takeoff limit",
-    "egt_continuous_exceeded": "EGT continuous limit",
-    "n1_vib_limit_exc": "N1 vibration limit",
-    "n2_vib_limit_exc": "N2 vibration limit",
-    "tire_overspeed": "Tire overspeed",
-    "n1_vib_advisory": "N1 vibration advisory",
-    "n2_vib_advisory": "N2 vibration advisory",
-    "n3_vib_advisory": "N3 vibration advisory",
-    "oil_low_press_flag": "Oil pressure low",
-    "oil_high_press_flag": "Oil pressure high",
-    "oil_temp_high_flag": "Oil temperature high",
-    "oil_qty_low_flag": "Oil quantity low",
-}
+_FLAG_LABELS = {s["key"]: s["label"] for s in _FLAG_SPEC}
+_LIMIT_FLAGS = [s["key"] for s in _FLAG_SPEC if s["severity"] == "Limit"]
+# fmw_active is excluded from the legacy advisory list to preserve the existing
+# per-fleet "Advisories" metric scope; it is still surfaced via _FLAG_SPEC below.
+_ADVISORY_FLAGS = [s["key"] for s in _FLAG_SPEC
+                   if s["severity"] == "Advisory" and s["key"] != "fmw_active"]
 
-# Certified FCOM/AMM limits for engine-trend overlays.
-# mirrors _LIMITS in airbus_foqa_compute_op.py (certified FCOM/AMM values); keep in sync.
-# EGT limits intentionally omitted — producer marks them placeholder/TBD pending CFM/RR OEM data.
+# Single limit source — exact mirror of _LIMITS in airbus_foqa_compute_op.py
+# (certified FCOM/AMM values); keep in sync. Feeds BOTH the engine-trend overlays
+# and the Fleet Exceedance Summary. EGT/TGT thresholds are the producer's
+# placeholder values (PIPC CFM/RR confirmation pending) — the trend overlays still
+# omit EGT (_TREND_LIMITS has no EGT entry), but the producer emits the EGT flags
+# against these constants, so the summary surfaces them.
 _FLEET_LIMITS = {
     "A320FAM": {
+        "vmo_kias": 350.0,
+        "mmo": 0.82,
+        "vle_kias": 280.0,
+        "max_tire_speed_kt": 195.0,
         "n1_vib_advisory": 6.0,
         "n1_vib_limit": 5.0,
         "n2_vib_advisory": 4.3,
         "n2_vib_limit": 5.0,
         "oil_press_advisory_psi": 16.0,
         "oil_press_red_psi": 13.0,
+        "oil_press_high_psi": 90.0,
+        "oil_temp_high_c": 140.0,
+        "oil_qty_low_qt": 3.0,
+        "egt_takeoff_c": 950.0,
+        "egt_continuous_c": 925.0,
     },
     "A330": {
+        "vmo_kias": 330.0,
+        "mmo": 0.86,
+        "vle_kias": 250.0,
+        "max_tire_speed_kt": 204.0,
         "n1_vib_advisory": 5.7,
         "n2_vib_advisory": 5.6,
         "oil_press_low_psi": 30.0,
+        "oil_temp_high_c": 140.0,
+        "oil_qty_low_qt": 3.0,
+        "egt_takeoff_c": 900.0,
+        "egt_continuous_c": 875.0,
     },
 }
 
 _FLEET_KEY = {"A320/A321": "A320FAM", "A330": "A330"}
+
+_DIR_ARROW = {"up": "↑", "down": "↓"}
+
+
+def _fmt_num(v) -> str:
+    if v is None or (isinstance(v, float) and pd.isna(v)):
+        return "—"
+    return f"{v:.2f}" if abs(v) < 10 else f"{v:.0f}"
+
+
+@st.cache_data(ttl=300)
+def _fleet_exceedance_summary(df_a320: pd.DataFrame, df_a330: pd.DataFrame, days_back: int):
+    """Consolidated A320+A330 exceedance view for the window.
+
+    Returns (kpi, top10) where kpi holds per-fleet aircraft-with-exceedance counts
+    plus total breaching flights, and top10 is the worst breaching parameter per
+    aircraft ranked by severity (Limit > Advisory) then breaching-flight count then
+    margin — so flags without a numeric limit never sink out of the ranking."""
+    cutoff = pd.Timestamp.now() - pd.Timedelta(days=days_back)
+    kpi = {"A320/A321": 0, "A330": 0, "flights": 0}
+    rows = []
+    for fleet_label, fleet_key, df in (
+        ("A320/A321", "A320FAM", df_a320),
+        ("A330", "A330", df_a330),
+    ):
+        if df.empty or "date" not in df.columns:
+            continue
+        sub = df[df["date"] >= cutoff]
+        flag_keys = [s["key"] for s in _FLAG_SPEC if s["key"] in sub.columns]
+        if sub.empty or not flag_keys:
+            continue
+        breach_any = sub[flag_keys].fillna(False).astype(bool).any(axis=1)
+        kpi["flights"] += int(breach_any.sum())
+        kpi[fleet_label] = int(sub.loc[breach_any, AC_COL].nunique())
+        limits = _FLEET_LIMITS.get(fleet_key, {})
+
+        for ac, g in sub.groupby(AC_COL):
+            tb = int(g[flag_keys].fillna(False).astype(bool).any(axis=1).sum())
+            cand = []
+            for s in _FLAG_SPEC:
+                if s["key"] not in g.columns:
+                    continue
+                bm = g[s["key"]].fillna(False).astype(bool)
+                n = int(bm.sum())
+                if n == 0:
+                    continue
+                gb = g[bm]
+                val = None
+                vcols = [c for c in s["value_cols"] if c in gb.columns]
+                if vcols:
+                    vv = gb[vcols].apply(pd.to_numeric, errors="coerce")
+                    series = vv.min(axis=1) if s["direction"] == "down" else vv.max(axis=1)
+                    if series.notna().any():
+                        val = float(series.min() if s["direction"] == "down" else series.max())
+                limit = limits.get(s["limit_key"]) if s["limit_key"] else None
+                margin = (val - limit) if (val is not None and limit is not None) else None
+                if margin is not None and limit not in (None, 0):
+                    norm = margin / abs(limit) if s["direction"] == "up" else -margin / abs(limit)
+                else:
+                    norm = None
+                cand.append({
+                    "sev": 2 if s["severity"] == "Limit" else 1,
+                    "has_num": 1 if margin is not None else 0,
+                    "norm": norm if norm is not None else 0.0,
+                    "n": n,
+                    "label": s["label"],
+                    "value": val,
+                    "limit": limit,
+                    "margin": margin,
+                    "dir": _DIR_ARROW.get(s["direction"], "—"),
+                    "phase": s["phase"],
+                    "latest": gb["date"].max(),
+                })
+            if not cand:
+                continue
+            worst = max(cand, key=lambda c: (c["sev"], c["has_num"], c["norm"], c["n"]))
+            max_sev = max(c["sev"] for c in cand)
+            best_norm = max((c["norm"] for c in cand if c["sev"] == max_sev), default=0.0)
+            rows.append({
+                "_sev": max_sev, "_tb": tb, "_norm": best_norm,
+                "Fleet": fleet_label,
+                "Aircraft": str(ac),
+                "Worst parameter": worst["label"],
+                "Value": _fmt_num(worst["value"]),
+                "Limit": _fmt_num(worst["limit"]),
+                "Margin": f"{worst['margin']:+.2f}" if worst["margin"] is not None else "—",
+                "Dir": worst["dir"],
+                "Breaching flights": worst["n"],
+                "Driving phase": worst["phase"],
+                "Latest breach": worst["latest"].strftime("%d-%b-%Y") if pd.notna(worst["latest"]) else "—",
+            })
+
+    if not rows:
+        return kpi, pd.DataFrame()
+    top = (
+        pd.DataFrame(rows)
+        .sort_values(["_sev", "_tb", "_norm"], ascending=False)
+        .head(10)
+        .drop(columns=["_sev", "_tb", "_norm"])
+        .reset_index(drop=True)
+    )
+    return kpi, top
 
 # dashboard column -> list of (limit_key, severity, direction, label)
 _TREND_LIMITS = {
@@ -172,6 +299,14 @@ if df_a320.empty and df_a330.empty:
     st.error("No data yet. Run the `airbus_foqa_moqa_job` in Dagster.")
     st.stop()
 
+st.caption(
+    f"Reports loaded — A320/A321: {len(df_a320):,} flights · A330: {len(df_a330):,} flights"
+)
+if df_a320.empty:
+    st.info("A320/A321 FOQA report is missing or empty — A320 views are unavailable.")
+if df_a330.empty:
+    st.info("A330 FOQA report is missing or empty — A330 views are unavailable.")
+
 _latest_date = max([d["date"].max() for d in (df_a320, df_a330) if not d.empty], default=None)
 if _latest_date is not None and pd.notna(_latest_date):
     st.caption(f"Data through {_latest_date.strftime('%d-%b-%Y')} · auto-refreshed hourly")
@@ -182,6 +317,30 @@ with st.sidebar:
     days_back = st.slider("Days of history", 7, 365, 60)
 
 cutoff = pd.Timestamp.now() - pd.Timedelta(days=days_back)
+
+# ── Fleet Exceedance Summary (consolidated A320 + A330) ────────────────────────
+st.subheader(":material/rule: Fleet Exceedance Summary")
+st.caption(
+    f"Hard-limit and advisory ATA-05 events across both Airbus fleets in the last "
+    f"{days_back} days — worst breaching parameter per aircraft, ranked by severity."
+)
+
+_kpi, _top = _fleet_exceedance_summary(df_a320, df_a330, days_back)
+
+k1, k2, k3 = st.columns(3)
+k1.metric("A320/A321 aircraft with exceedances", _kpi["A320/A321"])
+k2.metric("A330 aircraft with exceedances", _kpi["A330"])
+k3.metric("Breaching flights (both fleets)", f"{_kpi['flights']:,}")
+
+if _top.empty:
+    st.success(f"No exceedances recorded across A320/A330 in the last {days_back} days.")
+else:
+    st.dataframe(_top, use_container_width=True, hide_index=True)
+    st.caption(
+        "Margin is signed value − limit; Dir marks ↑ above / ↓ below the limit. "
+        "Flags without a published numeric limit appear as — and stay ranked by "
+        "severity. EGT/TGT thresholds are provisional (OEM PIPC confirmation pending)."
+    )
 
 
 def _exceedance_summary(df: pd.DataFrame) -> pd.DataFrame:
