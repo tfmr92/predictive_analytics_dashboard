@@ -19,12 +19,20 @@ PSI_CYAN  = 1155   # Oxygen: Observer Oxy Lo Press — cyan CAS
 PSI_AMBER = 845    # Oxygen: Crew Oxy Lo Press — amber CAS / no dispatch
 FORECAST_HORIZON_DAYS = 30  # fixed planning horizon for upcoming inspections
 
+# E2 SAV is now sourced from the ACARS-validated start-transient model (the same
+# report 1_SAV.py trusts), not the dead aggregate. The transient parquet carries no
+# explicit alert column, so mirror 1_SAV.py _is_alert's fallback (prob >= the
+# documented calibrated High band) and guard the call with a recency window so a
+# stale flight's score cannot become a permanent false alert on the landing page.
+_SAV_HIGH = 0.60          # mirrors 1_SAV.py _THRESHOLD_HIGH — calibrated High band
+_SAV_RECENCY_DAYS = 30    # last_flight_dt must be within this window to alert
+
 # Pipeline sources for the health panel: (label, df_key, report filename, producing Dagster job).
 # 'Last refresh' keys off the Drive mtime of each filename — the producing job runs on a fixed
 # schedule regardless of new flights, so a stale mtime means the job stopped, not that the fleet is idle.
 PIPELINE_SOURCES = [
-    ("SAV LH (E2)",         "sav_lh",      "e2_sav_lh_report.parquet",        "save_sav_report"),
-    ("SAV RH (E2)",         "sav_rh",      "e2_sav_rh_report.parquet",        "save_sav_report"),
+    ("SAV LH (E2)",         "sav_lh",      "e2_sav_transient_lh_report.parquet", "save_sav_transient_report"),
+    ("SAV RH (E2)",         "sav_rh",      "e2_sav_transient_rh_report.parquet", "save_sav_transient_report"),
     ("SAV A320 — Eng 1",    "sav_a320_e1", "airbus_sav_eng1_report.parquet",  "save_airbus_sav_report"),
     ("SAV A320 — Eng 2",    "sav_a320_e2", "airbus_sav_eng2_report.parquet",  "save_airbus_sav_report"),
     ("Oxygen (E2)",         "oxy",         "e2_oxy_report.parquet",           "save_oxy_report"),
@@ -40,8 +48,8 @@ PIPELINE_SOURCES = [
 def _load_all() -> tuple[dict, dict]:
     datasets, errors = {}, {}
     for key, filename in {
-        "sav_lh":      "e2_sav_lh_report.parquet",
-        "sav_rh":      "e2_sav_rh_report.parquet",
+        "sav_lh":      "e2_sav_transient_lh_report.parquet",
+        "sav_rh":      "e2_sav_transient_rh_report.parquet",
         "oxy":         "e2_oxy_report.parquet",
         "foqa":        "e2_foqa_report.parquet",
         "wnb":         "e2_wnb_report.parquet",
@@ -269,23 +277,46 @@ def _fuel_alerts(df_fuel: pd.DataFrame, cutoff_ts: pd.Timestamp) -> tuple[dict, 
 
 # ── Build per-system alert snapshots ─────────────────────────────────────────
 
-# SAV LH
-sav_lh_latest = _latest(data["sav_lh"], "ac_sn")
-sav_lh_alert: dict = {}
-if not sav_lh_latest.empty and "pre_lh_sav_failure_prediction" in sav_lh_latest.columns:
-    sav_lh_alert = dict(zip(
-        sav_lh_latest["ac_sn"].astype(str),
-        sav_lh_latest["pre_lh_sav_failure_prediction"].astype(int),
-    ))
+# SAV (E2) — ACARS-validated start-transient model (the same report 1_SAV.py trusts).
+# One row per aircraft (median of the last N starts) with a calibrated pre-failure
+# probability and a last_flight_dt; no explicit alert column. We mirror 1_SAV.py
+# _is_alert's fallback (prob >= _SAV_HIGH) and gate it on a recency window so a stale
+# flight's score cannot become a permanent false alert. Returns {ac_sn: 1|0} — the
+# SAME shape the old aggregate produced, so every downstream consumer is untouched.
+def _sav_transient_alert(df: pd.DataFrame) -> dict:
+    if (df is None or df.empty
+            or "ac_sn" not in df.columns
+            or "sav_transient_prob" not in df.columns):
+        return {}
+    d = df.copy()
+    d["ac_sn"] = (
+        d["ac_sn"].astype(str).str.strip().str.replace(r"\.0$", "", regex=True)
+    )
+    d["sav_transient_prob"] = pd.to_numeric(d["sav_transient_prob"], errors="coerce")
+    if "last_flight_dt" in d.columns:
+        d["last_flight_dt"] = pd.to_datetime(d["last_flight_dt"], errors="coerce")
+    else:
+        d["last_flight_dt"] = pd.NaT
+    # Latest row per aircraft (transient is already 1 row/ac; sort is a safety net).
+    d = d.sort_values("last_flight_dt").groupby("ac_sn").last().reset_index()
+    recency_floor = pd.Timestamp(date.today() - timedelta(days=_SAV_RECENCY_DAYS))
+    alert: dict = {}
+    for _, row in d.iterrows():
+        p, lf = row["sav_transient_prob"], row["last_flight_dt"]
+        is_alert = (
+            pd.notna(p) and p >= _SAV_HIGH
+            and pd.notna(lf) and lf >= recency_floor
+        )
+        alert[row["ac_sn"]] = 1 if is_alert else 0
+    return alert
 
-# SAV RH
-sav_rh_latest = _latest(data["sav_rh"], "ac_sn")
-sav_rh_alert: dict = {}
-if not sav_rh_latest.empty and "pre_rh_sav_failure_prediction" in sav_rh_latest.columns:
-    sav_rh_alert = dict(zip(
-        sav_rh_latest["ac_sn"].astype(str),
-        sav_rh_latest["pre_rh_sav_failure_prediction"].astype(int),
-    ))
+
+sav_lh_alert = _sav_transient_alert(data["sav_lh"])
+sav_rh_alert = _sav_transient_alert(data["sav_rh"])
+
+# Coverage of the transient model across both engines — surfaced below as a visible
+# assertion so a coverage collapse fails loud, never as silent zero-alerts.
+n_sav_cov = len(set(sav_lh_alert) | set(sav_rh_alert))
 
 # Oxygen
 oxy_ac_col = next((c for c in ("aircraftSerNum-1", "ac_sn") if c in data["oxy"].columns), None)
@@ -425,6 +456,21 @@ st.caption(
     "(>10% above their own baseline) — a monitor-tier heuristic confounded by "
     "weight/altitude/wind, not an asserted predictive catch."
 )
+
+# SAV (E2) coverage assertion — the SAV signal above is sourced from the
+# ACARS-validated transient model. Make the scored-aircraft count visible, and fail
+# LOUD if coverage collapses so a stalled job never reads as a clean zero-alert fleet.
+st.caption(
+    f":material/dataset: SAV (E2): {n_sav_cov} aircraft scored by the "
+    "ACARS-validated transient model."
+)
+if n_sav_cov == 0:
+    st.warning(
+        "SAV (E2): the start-transient model scored zero aircraft — the "
+        "`save_sav_transient_report` job may be stopped or its features table is "
+        "empty. Starter-valve predictions are unavailable until it refreshes; the "
+        "absence of SAV alerts here does NOT mean the fleet is clear."
+    )
 
 st.divider()
 
