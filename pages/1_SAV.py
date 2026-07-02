@@ -130,6 +130,27 @@ def _normalize(df: pd.DataFrame) -> pd.DataFrame:
 df_lh = _normalize(df_lh)
 df_rh = _normalize(df_rh)
 
+# ── Monte Carlo RUL (from estimate_rul_op) ────────────────────────────────────
+_df_rul_lh = _load_parquet("e2_sav_transient_rul_lh.parquet")
+_df_rul_rh = _load_parquet("e2_sav_transient_rul_rh.parquet")
+
+_RUL_COLS = ["rul_median_days", "rul_p10_days", "rul_p90_days", "rul_n_points"]
+
+
+def _merge_rul(df_main: pd.DataFrame, df_rul: pd.DataFrame) -> pd.DataFrame:
+    if df_main.empty or df_rul.empty or "ac_sn" not in df_rul.columns:
+        return df_main
+    rul = df_rul[["ac_sn"] + [c for c in _RUL_COLS if c in df_rul.columns]].copy()
+    rul["ac_sn"] = rul["ac_sn"].astype(str).str.strip().str.replace(r"\.0$", "", regex=True)
+    for c in _RUL_COLS:
+        if c in rul.columns:
+            rul[c] = pd.to_numeric(rul[c], errors="coerce")
+    return df_main.merge(rul, on="ac_sn", how="left")
+
+
+df_lh = _merge_rul(df_lh, _df_rul_lh)
+df_rh = _merge_rul(df_rh, _df_rul_rh)
+
 
 @st.cache_data(ttl=300)
 def _load_flights(filename: str) -> pd.DataFrame:
@@ -300,7 +321,8 @@ alert_rh = set(df_rh.loc[_is_alert(df_rh), "ac_sn"]) if not df_rh.empty else set
 
 # ── Data freshness ────────────────────────────────────────────────────────────
 render_freshest_badge(
-    ["e2_sav_transient_lh_report.parquet", "e2_sav_transient_rh_report.parquet"],
+    ["e2_sav_transient_lh_report.parquet", "e2_sav_transient_rh_report.parquet",
+     "e2_sav_transient_rul_lh.parquet", "e2_sav_transient_rul_rh.parquet"],
     label="SAV transient report",
     stale_hours=48,
 )
@@ -454,18 +476,42 @@ def _risk_bar(df: pd.DataFrame, title: str, assess: dict) -> go.Figure | None:
 
 
 def _action_table(df: pd.DataFrame, assess: dict) -> pd.DataFrame:
-    """High + Watch aircraft with their fused action and confirming drivers,
+    """High + Watch aircraft with their fused action, confirming drivers and RUL,
     ordered by action severity then probability."""
+    # Build RUL lookup from columns merged into df (one row per aircraft)
+    rul_by_ac: dict = {}
+    if "rul_median_days" in df.columns and "ac_sn" in df.columns:
+        for ac, row in df.drop_duplicates("ac_sn").set_index("ac_sn").iterrows():
+            rul_by_ac[ac] = {
+                "med": row.get("rul_median_days", np.nan),
+                "p10": row.get("rul_p10_days",    np.nan),
+                "p90": row.get("rul_p90_days",    np.nan),
+            }
+
     rows = []
     for ac in df["ac_sn"] if "ac_sn" in df.columns else []:
         r = assess["rows"].get(ac)
         if not r or r["action"] == "—":
             continue
+        rul = rul_by_ac.get(ac, {})
+        med = rul.get("med", np.nan)
+        p10 = rul.get("p10", np.nan)
+        p90 = rul.get("p90", np.nan)
+        if pd.notna(med):
+            if med == 0:
+                rul_str = "Now (above threshold)"
+            else:
+                lo = f"{int(round(p10))}" if pd.notna(p10) else "?"
+                hi = f"{int(round(p90))}" if pd.notna(p90) else "?"
+                rul_str = f"{int(round(med))} d  [{lo}–{hi} d]"
+        else:
+            rul_str = "— (< 8 starts)"
         rows.append({
             "Aircraft": _dnm(ac),
             "Probability": f"{r['prob']:.0%}" if pd.notna(r["prob"]) else "—",
             "Action": r["action"],
             "Confirming drivers": ", ".join(r["drivers"]) if r["drivers"] else "—",
+            "Est. time to failure": rul_str,
             "_o": _ACTION_ORDER.index(r["action"]),
             "_p": r["prob"] if pd.notna(r["prob"]) else -1.0,
         })
@@ -474,6 +520,105 @@ def _action_table(df: pd.DataFrame, assess: dict) -> pd.DataFrame:
         tab = (tab.sort_values(["_o", "_p"], ascending=[True, False])
                   .drop(columns=["_o", "_p"]))
     return tab
+
+
+def _rul_chart(df: pd.DataFrame, assess: dict, side: str) -> go.Figure | None:
+    """Horizontal bar chart: Monte Carlo estimated time-to-failure per aircraft.
+
+    Shows only aircraft with a non-Normal recommended action.
+    Error bars = 80% confidence interval (P10–P90).
+    A dotted reference line marks the historical median fault→removal lead time.
+    """
+    if df.empty or "rul_median_days" not in df.columns or "ac_sn" not in df.columns:
+        return None
+
+    rows = []
+    for _, row in df.iterrows():
+        ac = row.get("ac_sn")
+        if pd.isna(ac):
+            continue
+        r = assess["rows"].get(ac, {})
+        if not r or r.get("action", "—") == "—":
+            continue
+        try:
+            med = float(row["rul_median_days"]) if pd.notna(row.get("rul_median_days")) else np.nan
+            p10 = float(row["rul_p10_days"])    if pd.notna(row.get("rul_p10_days"))   else np.nan
+            p90 = float(row["rul_p90_days"])    if pd.notna(row.get("rul_p90_days"))   else np.nan
+        except (TypeError, ValueError, KeyError):
+            med, p10, p90 = np.nan, np.nan, np.nan
+        rows.append({
+            "display": _dnm(ac),
+            "action":  r.get("action", "—"),
+            "med": med, "p10": p10, "p90": p90,
+            "prob": r.get("prob", np.nan),
+        })
+
+    if not rows:
+        return None
+
+    d = pd.DataFrame(rows).sort_values("med", ascending=True, na_position="last")
+    has_est = d[d["med"].notna() & (d["med"] > 0)]
+    at_thr  = d[d["med"] == 0.0]
+    no_est  = d[d["med"].isna()]
+    n_shown = len(has_est) + len(at_thr) + len(no_est)
+
+    fig = go.Figure()
+
+    if not has_est.empty:
+        err_lo = (has_est["med"] - has_est["p10"]).clip(lower=0).fillna(0)
+        err_hi = (has_est["p90"] - has_est["med"]).clip(lower=0).fillna(0)
+        hover = [
+            f"{r.display}<br>"
+            f"Est. time to failure: <b>{int(round(r.med))} d</b><br>"
+            f"80% CI: {int(round(r.p10)) if pd.notna(r.p10) else '?'}–"
+            f"{int(round(r.p90)) if pd.notna(r.p90) else '?'} d<br>"
+            f"Pre-failure prob: {r.prob:.0%}  |  Action: {r.action}"
+            for _, r in has_est.iterrows()
+        ]
+        fig.add_trace(go.Bar(
+            y=has_est["display"], x=has_est["med"], orientation="h",
+            name="Est. time to failure",
+            marker_color=has_est["action"].map(_ACTION_COLOR).tolist(),
+            error_x=dict(
+                type="data", visible=True,
+                array=err_hi.tolist(), arrayminus=err_lo.tolist(),
+                color="#94a3b8", thickness=2, width=4,
+            ),
+            text=[f"{int(round(v))} d" for v in has_est["med"]],
+            textposition="outside",
+            hovertext=hover,
+            hovertemplate="%{hovertext}<extra></extra>",
+        ))
+
+    for subset, label, color, note in [
+        (at_thr,  "Above threshold",    "#ef4444", "Prob already above threshold"),
+        (no_est,  "Insufficient starts", "#94a3b8", "Need ≥ 8 decoded starts for RUL"),
+    ]:
+        if not subset.empty:
+            fig.add_trace(go.Bar(
+                y=subset["display"], x=[2.0] * len(subset), orientation="h",
+                name=label, marker_color=color,
+                text=[note] * len(subset), textposition="outside",
+                hovertext=subset["display"].tolist(),
+                hovertemplate=f"<b>%{{hovertext}}</b><br>{note}<extra></extra>",
+            ))
+
+    # Reference: median fault→removal lead time from ACARS validation (18.5 d)
+    fig.add_vline(
+        x=18.5, line_dash="dot", line_color="#94a3b8", line_width=1,
+        annotation_text="Median lead time (18.5 d)",
+        annotation_font_size=9, annotation_position="top right",
+    )
+
+    fig.update_layout(
+        title=f"Estimated time to failure — {side}",
+        xaxis=dict(title="Days", rangemode="tozero"),
+        yaxis_title="", yaxis_autorange="reversed",
+        height=max(260, n_shown * 34 + 100),
+        margin=dict(l=10, r=130, t=50, b=10),
+        legend=dict(orientation="h", y=-0.2, font=dict(size=10)),
+    )
+    return fig
 
 
 def _driver_percentiles(df: pd.DataFrame) -> tuple[pd.DataFrame, list]:
@@ -748,6 +893,36 @@ with tab_rank:
         "driver — possible sensor/context, verify first) · yellow **Monitor** (Watch "
         "band) · green normal. Confirming drivers are listed per aircraft above."
     )
+
+    # ── Monte Carlo RUL ───────────────────────────────────────────────────────
+    _rul_ready = "rul_median_days" in df_lh.columns or "rul_median_days" in df_rh.columns
+    if _rul_ready:
+        st.divider()
+        st.subheader(":material/schedule: Estimated time to failure (Monte Carlo)")
+        st.caption(
+            "Wiener process with drift fitted on each aircraft's historical "
+            "P(pre-failure) trajectory (individual starts, not aggregated). "
+            "Bar = median days to threshold crossing; error bar = 80% CI (P10–P90). "
+            "The dotted line is the historical median fault→removal lead time (18.5 d) "
+            "from ACARS-confirmed removals."
+        )
+        col_rul_l, col_rul_r = st.columns(2)
+        for col_widget, df_side, side, assess in [
+            (col_rul_l, df_lh, "LH", assess_lh),
+            (col_rul_r, df_rh, "RH", assess_rh),
+        ]:
+            with col_widget:
+                fig_rul = _rul_chart(df_side, assess, side)
+                if fig_rul is None:
+                    st.info(f"No monitored aircraft or no RUL data available for {side}.")
+                else:
+                    st.plotly_chart(fig_rul, use_container_width=True)
+    else:
+        st.info(
+            "RUL estimates not yet available — trigger a run of "
+            "`save_sav_transient_report_job` in Dagster to generate them "
+            "(`estimate_rul_op` runs as part of that job)."
+        )
 
 # ── Per-engine driver views ───────────────────────────────────────────────────
 for tab, df_side, side, df_flights, alert_side in [
