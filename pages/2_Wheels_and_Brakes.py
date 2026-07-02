@@ -14,7 +14,7 @@ import plotly.graph_objects as go
 import numpy as np
 import streamlit as st
 
-from utils.drive_loader import load, make_prefix_map, display_name, clean_df
+from utils.drive_loader import load, make_prefix_map, display_name, clean_df, render_freshest_badge
 
 st.set_page_config(page_title="Wheels & Brakes", layout="wide")
 
@@ -73,20 +73,21 @@ if "ac_sn" in df.columns:
 _disp_col = "_display" if "_display" in df.columns else "ac_sn"
 
 # ── Data freshness indicator ─────────────────────────────────────
+# Pipeline-refresh verdict keys off report mtime (Drive modifiedTime), so it
+# detects a stopped producing job and never cries wolf on idle weekends. The
+# latest-event date is kept only as data context, not as a freshness verdict
+# (per the documented "distinguish max-date from last-refresh" lesson).
+render_freshest_badge(["e2_wnb_report.parquet"], label="Wheels & Brakes report")
 if "date" in df.columns:
     _latest_event = df["date"].max()
     if pd.notna(_latest_event):
-        _age_days = (pd.Timestamp.now().normalize() - _latest_event.normalize()).days
-        _freshness_msg = (
-            f"Latest flight event: **{_latest_event:%d-%b-%Y}** "
-            f"({_age_days} day(s) ago)"
-        )
-        if _age_days <= 2:
-            st.success(_freshness_msg)
-        else:
-            st.warning(f"{_freshness_msg} — wheel/brake data may be stale.")
-    else:
-        st.info("No valid flight dates in the loaded dataset.")
+        st.caption(f"Latest flight event: {_latest_event:%d-%b-%Y}")
+# TRAX removal/maintenance is the ground-truth feed for wheel/brake life; surface
+# its own refresh state so a stopped producing job fails visible.
+render_freshest_badge(
+    ["e2_wnb_maintenance.parquet", "e2_brake_maintenance.parquet"],
+    label="TRAX removal/maintenance data",
+)
 
 # ── Sidebar controls ──────────────────────────────────────────
 with st.sidebar:
