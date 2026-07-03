@@ -239,8 +239,48 @@ def _present_signals(df: pd.DataFrame) -> list:
     return out
 
 
+# Pipeline triage → page vocabulary. The scoring job now computes the triage
+# upstream (M-of-N persistence over the F2 threshold + ACARS fault-message
+# corroboration); when those columns are present they are authoritative.
+_PIPE_ACTION_MAP = {
+    "Inspect": "Inspect",       # persistent model alert + ACARS fault → act
+    "Monitor": "Investigate",   # persistent model alert only → verify context
+    "Watch": "Monitor",         # ACARS fault only → keep an eye
+    "Normal": "—",
+}
+
+
+def _pipeline_assessment(df: pd.DataFrame) -> dict:
+    """Authoritative triage computed by the scoring job (persistence + ACARS)."""
+    out = {"conf_sigs": ["ACARS fault messages"], "rows": {}, "available": True,
+           "source": "pipeline"}
+    for _, row in df.iterrows():
+        ac = row["ac_sn"]
+        p = row["sav_transient_prob"]
+        drivers = []
+        acars_hit = bool(row.get("acars_fault_recent"))
+        if acars_hit:
+            codes = str(row.get("acars_fault_codes") or "").strip()
+            n = int(row.get("acars_n_faults") or 0)
+            drivers.append(f"ACARS {codes or 'SAV fault'} x{n} (30 d)")
+        if bool(row.get("persistent_alert")):
+            n_above = int(row.get("n_recent_above_f2") or 0)
+            drivers.append(f"{n_above}/7 recent starts above alert level")
+        rows_action = _PIPE_ACTION_MAP.get(str(row.get("action") or "Normal"), "—")
+        out["rows"][ac] = {
+            "prob": float(p) if pd.notna(p) else float("nan"),
+            "tier": _tier(p), "confirmed": acars_hit,
+            "drivers": drivers, "action": rows_action,
+        }
+    return out
+
+
 def _action_assessment(df: pd.DataFrame) -> dict:
     """Fuse the probability tier with physical confirmation.
+
+    Preferred source: the triage the scoring job stamps into the parquet
+    (`action` column — M-of-N persistence + ACARS corroboration). The EDA
+    heuristic below is the fallback for parquets that predate it.
 
     A signal *confirms at fleet level* when the high-risk median sits beyond the
     rest-of-fleet P75 (P25 for falling signals). An aircraft is *confirmed* when
@@ -255,6 +295,8 @@ def _action_assessment(df: pd.DataFrame) -> dict:
     out = {"conf_sigs": [], "rows": {}, "available": False}
     if df.empty or "sav_transient_prob" not in df.columns:
         return out
+    if "action" in df.columns and df["action"].notna().any():
+        return _pipeline_assessment(df)
     alert = _is_alert(df)
     high, rest = df[alert], df[~alert]
     conf = []  # (name, col, bad_dir, ref)
@@ -380,16 +422,30 @@ _lh_insp, _rh_insp = _acs_by_action(assess_lh, "Inspect"), _acs_by_action(assess
 _lh_invs, _rh_invs = _acs_by_action(assess_lh, "Investigate"), _acs_by_action(assess_rh, "Investigate")
 _n_mon = len(_acs_by_action(assess_lh, "Monitor")) + len(_acs_by_action(assess_rh, "Monitor"))
 
+_PIPELINE_TRIAGE = assess_lh.get("source") == "pipeline" or assess_rh.get("source") == "pipeline"
+
 c1, c2, c3, c4 = st.columns(4)
 c1.metric("Aircraft monitored", _n_monitored)
-c2.metric("Inspect now", len(_lh_insp) + len(_rh_insp),
-          help="High probability AND a fleet-discriminating driver degraded — "
-               "model and physical evidence agree.")
-c3.metric("Investigate", len(_lh_invs) + len(_rh_invs),
-          help="High probability but no confirming driver — verify sensor/context "
-               "before scheduling an inspection.")
-c4.metric("Monitor", _n_mon,
-          help="Watch band — trending toward the High operating point.")
+if _PIPELINE_TRIAGE:
+    c2.metric("Inspect now", len(_lh_insp) + len(_rh_insp),
+              help="Sustained model alert (5 of last 7 starts above the alert "
+                   "level) AND a SAV fault message from the aircraft CMS via "
+                   "ACARS in the last 30 days — two independent witnesses agree.")
+    c3.metric("Investigate", len(_lh_invs) + len(_rh_invs),
+              help="Sustained model alert without an ACARS fault message — "
+                   "verify sensor/context before scheduling an inspection.")
+    c4.metric("Monitor", _n_mon,
+              help="ACARS SAV fault message present but the model does not "
+                   "flag a sustained alert — keep an eye on the next starts.")
+else:
+    c2.metric("Inspect now", len(_lh_insp) + len(_rh_insp),
+              help="High probability AND a fleet-discriminating driver degraded — "
+                   "model and physical evidence agree.")
+    c3.metric("Investigate", len(_lh_invs) + len(_rh_invs),
+              help="High probability but no confirming driver — verify sensor/context "
+                   "before scheduling an inspection.")
+    c4.metric("Monitor", _n_mon,
+              help="Watch band — trending toward the High operating point.")
 
 # ── Fleet action triage banner (ignores the sidebar filter) ───────────────────
 if _lh_insp or _rh_insp:
@@ -399,8 +455,11 @@ if _lh_insp or _rh_insp:
     if _rh_insp:
         lines.append("**RH:** " + ", ".join(_dnm(m) for m in _rh_insp))
     st.error(
-        "Inspect now — high pre-failure probability confirmed by a degraded driver "
-        "(inspect starter air valve per AMM)\n\n" + "\n\n".join(lines)
+        ("Inspect now — sustained model alert corroborated by ACARS SAV fault "
+         "messages (inspect starter air valve per AMM)\n\n"
+         if _PIPELINE_TRIAGE else
+         "Inspect now — high pre-failure probability confirmed by a degraded driver "
+         "(inspect starter air valve per AMM)\n\n") + "\n\n".join(lines)
     )
 
 if _lh_invs or _rh_invs:
@@ -410,8 +469,11 @@ if _lh_invs or _rh_invs:
     if _rh_invs:
         lines.append("**RH:** " + ", ".join(_dnm(m) for m in _rh_invs))
     st.warning(
-        "Investigate — the model flags high risk but no fleet-discriminating driver "
-        "is degraded; check sensor/context before scheduling\n\n" + "\n\n".join(lines)
+        ("Investigate — sustained model alert without an ACARS fault message; "
+         "check sensor/context before scheduling\n\n"
+         if _PIPELINE_TRIAGE else
+         "Investigate — the model flags high risk but no fleet-discriminating driver "
+         "is degraded; check sensor/context before scheduling\n\n") + "\n\n".join(lines)
     )
 
 if not (_lh_insp or _rh_insp or _lh_invs or _rh_invs):
@@ -422,8 +484,11 @@ _all_prob = pd.concat(
      df_rh.get("sav_transient_prob", pd.Series(dtype=float))]
 )
 st.caption(
-    "Fleet-wide triage — fuses the transient probability with physical confirmation; "
-    "ignores the sidebar filter."
+    ("Fleet-wide triage — sustained model alerts (M-of-N persistence) gated by "
+     "ACARS fault-message corroboration; ignores the sidebar filter."
+     if _PIPELINE_TRIAGE else
+     "Fleet-wide triage — fuses the transient probability with physical confirmation; "
+     "ignores the sidebar filter.")
     + (f" Fleet mean probability {_all_prob.mean():.0%}." if not _all_prob.empty else "")
 )
 
@@ -833,13 +898,19 @@ _DB_URI = os.environ.get(
 def _load_confirmed_failures() -> pd.DataFrame:
     """Read the project's ground-truth SAV removal validation table.
 
-    Returns an empty DataFrame on any failure (missing table, connection
-    error, zero rows) so the tab can show a polite empty state and never
-    fabricate data.
+    Priority: (1) Google Drive parquet — works in cloud deploy;
+              (2) local Postgres — works on-prem.
+    Returns empty DataFrame on any failure so the tab degrades gracefully."""
+    # 1. Try Google Drive parquet (works in Streamlit Cloud)
+    try:
+        from utils.drive_loader import load as drive_load
+        df = drive_load("e2_sav_confirmed_failures.parquet")
+        if not df.empty:
+            return df
+    except Exception:
+        pass
 
-    sqlalchemy is imported lazily so the page never hard-depends on a DB driver:
-    in the isolated cloud deploy the on-prem Postgres is unreachable and this
-    simply degrades to the empty state."""
+    # 2. Fallback: on-prem Postgres (local dev)
     try:
         from sqlalchemy import create_engine, inspect, text
         engine = create_engine(_DB_URI)
