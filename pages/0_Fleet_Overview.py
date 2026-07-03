@@ -5,7 +5,7 @@ Covers E195-E2 (SAV, W&B, Oxygen, FOQA, Fuel) + A320/A330 (FOQA).
 """
 
 import math
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 
 import pandas as pd
 import plotly.graph_objects as go
@@ -582,6 +582,7 @@ st.caption(
     "Critical = alert/action required · Monitor = monitor · Normal = normal · — = no data in period"
 )
 
+df_matrix = pd.DataFrame()  # populated below when E2 renders; captured by the CSV export
 if "E2" in fleet_filter and all_e2:
     matrix_rows = []
     for msn in sorted(all_e2):
@@ -649,6 +650,7 @@ if "E2" in fleet_filter and all_e2:
         )
 
 # ── Airbus FOQA summary ───────────────────────────────────────────────────────
+df_a320_matrix = pd.DataFrame()  # full A320 health matrix; captured by the CSV export
 for fleet_key, fleet_label in [("a320", "A320"), ("a330", "A330")]:
     if fleet_label not in fleet_filter:
         continue
@@ -764,6 +766,7 @@ for fleet_key, fleet_label in [("a320", "A320"), ("a330", "A330")]:
                     {"Critical": 0, "Monitor": 1, "Normal": 2, "— No data": 3}
                 ),
             )
+            df_a320_matrix = df_hm  # full frame, before the top-10 display truncation
             _n_hm = len(df_hm)
             df_hm = df_hm.head(10)
             if _n_hm > 10:
@@ -786,6 +789,38 @@ for fleet_key, fleet_label in [("a320", "A320"), ("a330", "A330")]:
             st.info(
                 "No A320 aircraft available to build the health matrix in the selected window."
             )
+
+# ── Executive export ──────────────────────────────────────────────────────────
+st.divider()
+st.subheader(":material/download: Export fleet status")
+st.caption(
+    "Download the combined E2 + A320 health matrix as a CSV for the morning "
+    "maintenance meeting — the same per-aircraft statuses shown above, one row "
+    "per aircraft."
+)
+
+_export_parts = []
+if not df_matrix.empty:
+    _e2_exp = df_matrix.drop(columns=["MSN"], errors="ignore").copy()
+    _e2_exp.insert(0, "Fleet", "E2")
+    _export_parts.append(_e2_exp)
+if not df_a320_matrix.empty:
+    _a320_exp = df_a320_matrix.copy()
+    _a320_exp.insert(0, "Fleet", "A320")
+    _export_parts.append(_a320_exp)
+
+if _export_parts:
+    df_export = pd.concat(_export_parts, ignore_index=True)
+    st.download_button(
+        ":material/download: Export fleet status (CSV)",
+        data=df_export.to_csv(index=False).encode("utf-8"),
+        file_name=f"fleet_status_{datetime.now():%Y%m%d_%H%M}.csv",
+        mime="text/csv",
+    )
+else:
+    st.caption(
+        "No fleet-status rows are available in the current window to export."
+    )
 
 # ── Pipeline health ───────────────────────────────────────────────────────────
 st.divider()
