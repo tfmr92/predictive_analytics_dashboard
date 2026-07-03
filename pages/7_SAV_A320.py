@@ -193,9 +193,9 @@ SIGNALS = {
         "Time from starter engagement to start complete — laboured starts take longer.",
         "up",
     ),
-    "Starter Air Pressure (mean, active)": (
-        "sap_mean_active", "psi",
-        "Mean duct pressure while the starter is engaged — a leaking/slow valve delivers less.",
+    "Starter Air Pressure (peak)": (
+        "sap_max", "psi",
+        "Peak duct pressure during the crank — a leaking/slow valve reaches lower peak pressure.",
         "down",
     ),
     "N2 Acceleration 12→30%": (
@@ -203,9 +203,9 @@ SIGNALS = {
         "Core acceleration during cranking — falling trend means less starter torque delivered.",
         "down",
     ),
-    "EGT at Light-off": (
-        "egt_lightoff_c", "°C",
-        "Hotter light-offs accompany weak cranking (lower airflow at fuel-on).",
+    "Time to Peak ITT": (
+        "tpi", "seconds",
+        "Delayed peak ITT during light-off accompanies weak cranking from a slow-opening valve.",
         "up",
     ),
 }
