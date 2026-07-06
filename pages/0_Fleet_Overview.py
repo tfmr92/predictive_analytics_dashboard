@@ -82,6 +82,48 @@ def _load_all() -> tuple[dict, dict]:
     return datasets, errors
 
 
+# ── ACARS-validated SAV track record (ground truth) ───────────────────────────
+# Reads e2_sav_confirmed_failures.parquet (same table 1_SAV.py trusts) to back the
+# commercial 'unscheduled removals avoided' claim with confirmed-failure evidence.
+# Only rows with fault coverage are counted, so the ACARS coverage gap is never
+# scored as a no-fault-found removal. E2 SAV is the only fleet with this ground truth.
+@st.cache_data(ttl=300, show_spinner=False)
+def _load_sav_track_record() -> dict:
+    try:
+        df = load("e2_sav_confirmed_failures.parquet")
+    except Exception:
+        return {}
+    if df is None or df.empty:
+        return {}
+
+    def _pick(*cands):
+        for c in cands:
+            if c in df.columns:
+                return c
+        return None
+
+    c_conf = _pick("confirmed_by_acars", "confirmed")
+    c_cov = _pick("fault_data_available")
+    c_lead = _pick("days_fault_to_removal", "lead_days", "lead_time_days")
+    if not c_cov or not c_conf:
+        return {}
+
+    work = df.copy()
+    work[c_cov] = work[c_cov].fillna(False).astype(bool)
+    work[c_conf] = work[c_conf].fillna(False).astype(bool)
+    covered = work[work[c_cov]]
+    k = int(len(covered))
+    if k == 0:
+        return {}
+    m = int(covered[c_conf].sum())
+    med_lead = None
+    if c_lead and m:
+        lead = pd.to_numeric(covered.loc[covered[c_conf], c_lead], errors="coerce")
+        med = lead.median()
+        med_lead = None if pd.isna(med) else float(med)
+    return {"k": k, "m": m, "rate": m / k, "median_lead": med_lead}
+
+
 data, data_errors = _load_all()
 prefix_map = make_prefix_map()
 
@@ -456,6 +498,31 @@ st.caption(
     "(>10% above their own baseline) — a monitor-tier heuristic confounded by "
     "weight/altitude/wind, not an asserted predictive catch."
 )
+
+# ── Predictive track record (ACARS-validated ground truth, E2 SAV only) ────────
+# Grounds the 'unscheduled removals avoided' claim in confirmed failures: among past
+# SAV removals with ACARS fault coverage, how many were preceded by a real ACARS fault.
+_track = _load_sav_track_record()
+if _track:
+    _k, _m, _rate = _track["k"], _track["m"], _track["rate"]
+    _lead = _track["median_lead"]
+    _lead_txt = f"a median {_lead:.0f} days earlier" if _lead is not None else "ahead of the removal"
+    _small = " (small sample — treat as directional)" if _k < 10 else ""
+    st.caption(
+        f":material/verified: **E2 SAV track record (ACARS-validated)** — "
+        f"**{_m} of {_k}** confirmed removals (with ACARS fault coverage) were preceded "
+        f"by an ACARS fault {_lead_txt}, a {100 * _rate:.0f}% confirmation rate. "
+        f"Scope: E2 SAV, the only fleet with confirmed-failure ground truth. "
+        f"Coverage-gap removals are excluded, never counted as no-fault-found."
+        f"{_small}"
+    )
+else:
+    st.caption(
+        ":material/verified: **E2 SAV track record (ACARS-validated)** — ground-truth "
+        "validation is unavailable: `e2_sav_confirmed_failures.parquet` is missing or "
+        "empty. The commercial figures above are model-flagged candidates, not yet "
+        "cross-checked against confirmed removals."
+    )
 
 # SAV (E2) coverage assertion — the SAV signal above is sourced from the
 # ACARS-validated transient model. Make the scored-aircraft count visible, and fail
