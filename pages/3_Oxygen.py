@@ -539,6 +539,13 @@ if "psi" in df.columns and "delta_press" in df.columns and AC_COL:
             hide_index=True,
         )
 
+        st.download_button(
+            ":material/download: Export oxygen servicing forecast",
+            data=df_fc[display_cols].to_csv(index=False).encode("utf-8"),
+            file_name=f"oxygen_servicing_forecast_{pd.Timestamp.now():%Y%m%d_%H%M}.csv",
+            mime="text/csv",
+        )
+
 # ── Top pressure-drop events ──────────────────────────────────────────────────
 if "delta_press" in df.columns and "date" in df.columns:
     top_cols = ["date", AC_COL, "delta_press"] + (["psi"] if "psi" in df.columns else [])
