@@ -74,7 +74,7 @@ _latest_date = max(
     default=None,
 )
 if _latest_date is not None and pd.notna(_latest_date):
-    st.caption(f"Data through {_latest_date.strftime('%d-%b-%Y')} · auto-refreshed hourly")
+    st.caption(f"Data through {_latest_date.strftime('%d-%b-%Y')}")
 
 # ── Sidebar ───────────────────────────────────────────────────────────────────
 with st.sidebar:
@@ -178,6 +178,10 @@ st.caption(
     "filter. Red = predicted pre-failure on a recent start; amber = stale prediction "
     "(no start in 30+ days) pending aircraft-status verification."
 )
+
+# Placeholder rendered directly below the triage; filled by the "Why this
+# recommendation?" block once SIGNALS/_signal_eda are defined (see _explain_alert).
+_why_container = st.container()
 
 st.divider()
 
@@ -297,6 +301,144 @@ def _eda_histogram(stats: dict, title: str, unit: str, bad_dir: str) -> go.Figur
                       margin=dict(t=40, b=30, l=10, r=10),
                       legend=dict(orientation="h", y=1.12))
     return fig
+
+
+# ── Why this recommendation? — per-aircraft explanation of each fleet alert ─────
+# Turns each binary SAV pre-failure alert into an explained recommendation by
+# reusing the SAME confirming-signal selection as the Fleet Degradation Ranking
+# tab (a signal confirms when its predicted-pre-failure median sits beyond the
+# normal-start P75 for "up" / P25 for "down") and the shared SIGNALS/_signal_eda
+# helpers, so the triage stays a single source of truth.
+@st.cache_data(ttl=300)
+def _explain_alert(engine: int) -> dict:
+    df_full = df_e1_full if engine == 1 else df_e2_full
+    aged = _aged_e1 if engine == 1 else _aged_e2
+    alert_hist = ALERT_HISTORY_E1 if engine == 1 else ALERT_HISTORY_E2
+
+    result = {"aircraft": [], "fallback": False}
+    if df_full.empty or PRED_COL not in df_full.columns or AC_COL not in df_full.columns:
+        return result
+
+    # (1) confirming signals — identical criterion to tab_rank
+    confirming = {}  # signal_name -> (col, unit, bad_dir, stats)
+    for signal_name, (col, unit, _caption, bad_dir) in SIGNALS.items():
+        stats = _signal_eda(df_full, col, PRED_COL)
+        if stats is None:
+            continue
+        if bad_dir == "up" and stats["median_alert"] > stats["p75_normal"]:
+            confirming[signal_name] = (col, unit, bad_dir, stats)
+        elif bad_dir == "down" and stats["median_alert"] < stats["p25_normal"]:
+            confirming[signal_name] = (col, unit, bad_dir, stats)
+    n_confirming = len(confirming)
+    if n_confirming == 0:
+        return result
+
+    # (2) aircraft to explain: currently flagged (active + stale). If none is
+    # flagged now, fall back to the most-recently-flagged aircraft so this panel
+    # is never empty.
+    flagged = dict(aged)  # {tail: age_days}
+    today = pd.Timestamp.now().normalize()
+    if not flagged and alert_hist:
+        last_flag = df_full[df_full[PRED_COL].eq(1)].groupby(AC_COL)["date"].max()
+        if not last_flag.empty:
+            tail = str(last_flag.idxmax())
+            flagged = {tail: int((today - last_flag.max().normalize()).days)}
+            result["fallback"] = True
+
+    # (3) per confirming signal: aircraft recent-5-start median, its percentile vs
+    # the engine's fleet normal-start distribution, red zone = percentile >= 75
+    # (>= P75 for "up" / <= P25 for "down").
+    for tail, age in sorted(flagged.items()):
+        g = df_full[df_full[AC_COL].astype(str) == str(tail)].sort_values("date")
+        drivers = []
+        n_with_data = 0
+        for signal_name, (col, unit, bad_dir, stats) in confirming.items():
+            recent = g[col].dropna().tail(5)
+            if len(recent) < 3:
+                continue
+            n_with_data += 1
+            val = float(recent.median())
+            normal = stats["normal"]
+            if bad_dir == "up":
+                pct = float((normal < val).mean()) * 100.0
+            else:
+                pct = float((normal > val).mean()) * 100.0
+            if pct >= 75.0:
+                drivers.append({
+                    "signal": signal_name, "unit": unit, "value": val,
+                    "pct": pct, "dir": bad_dir,
+                })
+        result["aircraft"].append({
+            "tail": str(tail),
+            "age": int(age),
+            "stale": bool(age > RECENCY_DAYS),
+            "drivers": drivers,
+            "n_red": len(drivers),
+            "n_confirming": n_confirming,
+            "thin": n_with_data == 0,
+        })
+    return result
+
+
+_explanations = {e: _explain_alert(e) for e in (1, 2)}
+if any(x["aircraft"] for x in _explanations.values()):
+    with _why_container:
+        st.markdown("##### :material/help: Why this recommendation?")
+        st.caption(
+            "Per-aircraft, physically-grounded explanation of the SAV pre-failure "
+            "alert above — each flagged aircraft's recent starts compared against the "
+            "fleet's normal-start distribution."
+        )
+        for engine in (1, 2):
+            exp = _explanations[engine]
+            if not exp["aircraft"]:
+                continue
+            with st.expander(
+                f"Why is each flagged aircraft flagged? — Engine {engine}",
+                expanded=False,
+            ):
+                if exp["fallback"]:
+                    st.caption(
+                        "No aircraft is flagged on its latest start right now — showing "
+                        "the most recently flagged aircraft for reference."
+                    )
+                for ac in exp["aircraft"]:
+                    status = "stale alert" if ac["stale"] else "active alert"
+                    st.markdown(
+                        f"**{ac['tail']}** — {status}, last flagged start "
+                        f"{ac['age']}d ago"
+                    )
+                    if ac["thin"]:
+                        st.caption(
+                            "Too few recent starts to attribute this alert to specific "
+                            "signals (thin coverage) — verify aircraft status and recent "
+                            "QAR uploads."
+                        )
+                        continue
+                    if ac["drivers"]:
+                        for d in ac["drivers"]:
+                            arrow = "↑" if d["dir"] == "up" else "↓"
+                            st.markdown(
+                                f"- {arrow} **{d['signal']}** — {d['value']:.2f} "
+                                f"{d['unit']} · fleet percentile {d['pct']:.0f} vs "
+                                "normal starts"
+                            )
+                    else:
+                        st.markdown(
+                            "- No confirming signal is currently in the red zone for "
+                            "this aircraft, though the model flags it — monitor."
+                        )
+                    st.caption(
+                        f"{ac['n_red']} of {ac['n_confirming']} confirming signals in "
+                        "the red zone. Recommended action: inspect/borescope the "
+                        "starter air valve — ATA 80."
+                    )
+                st.caption(
+                    "Physically-grounded, post-hoc explanation of the model's call "
+                    "(recent starts vs the fleet's normal-start distribution) — not a "
+                    "SHAP feature attribution. A320 has no confirmed-failure record, so "
+                    "this is not validated against ground-truth SAV removals."
+                )
 
 
 # ── Tabs ──────────────────────────────────────────────────────────────────────
