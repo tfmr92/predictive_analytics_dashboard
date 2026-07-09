@@ -80,6 +80,16 @@ for phase_en, phase_label in _PHASE_MAP.items():
 
 cruise_cols = [c for c in burn_cols if "cruise" in c]
 
+# Map each engine number to its cruise-burn column, so Section 6 can localize a
+# tail's rising cruise burn to a specific engine (ENG1 / ENG2).
+_CRUISE_ENG_COLS: dict[int, str] = {}
+for _c in cruise_cols:
+    _motor = burn_cols[_c][1]  # e.g. "Engine 1"
+    try:
+        _CRUISE_ENG_COLS[int(_motor.split()[-1])] = _c
+    except (ValueError, IndexError):
+        pass
+
 # Ensure all fuel columns are numeric (parquet may deserialise them as strings)
 all_burn_cols = list(burn_cols.keys())
 for _c in all_burn_cols:
@@ -113,6 +123,19 @@ else:
 _MIN_BASELINE_FLIGHTS = 5
 _AMBER_FACTOR = 1.05
 _RED_FACTOR = 1.10
+
+# Per-engine cruise-burn metric, normalized identically to _cruise_kg_per_hr
+# (divided by the same cruise duration when _USE_RATE, so units stay kg/h). Lets
+# Section 6 re-run the own-baseline method on each engine and name the rising one.
+_ENG_METRIC: dict[int, str] = {}
+for _eng_n, _eng_col in _CRUISE_ENG_COLS.items():
+    _mcol = f"_cruise_eng{_eng_n}_metric"
+    _eng_series = pd.to_numeric(df[_eng_col], errors="coerce")
+    if _USE_RATE:
+        df[_mcol] = np.where(_dur_hr > 0, _eng_series / _dur_hr, np.nan)
+    else:
+        df[_mcol] = _eng_series
+    _ENG_METRIC[_eng_n] = _mcol
 
 
 @st.cache_data(ttl=300)
@@ -148,6 +171,20 @@ def _build_cruise_watchlist(df_in, metric, ac_col, min_flights, amber, red):
             "Baseline": baseline, "pct_above": pct_above, "Flights": n,
         })
     return pd.DataFrame(rows), n_excluded
+
+
+@st.cache_data(ttl=300)
+def _engine_pct_map(df_in, eng_metric, ac_col, min_flights, amber, red):
+    """Recent %-above-own-baseline per engine, reusing _build_cruise_watchlist on
+    each engine's own cruise-burn metric. Returns {tail: {eng_n: pct_above}}."""
+    out: dict = {}
+    for eng_n, mcol in eng_metric.items():
+        wl_eng, _ = _build_cruise_watchlist(
+            df_in[["date", mcol, ac_col]], mcol, ac_col, min_flights, amber, red,
+        )
+        for _, r in wl_eng.iterrows():
+            out.setdefault(r["Aircraft"], {})[eng_n] = float(r["pct_above"])
+    return out
 
 
 # Build the watchlist once, up front; both the headline KPI (c4) and Section 6
@@ -519,9 +556,34 @@ else:
         if caption_parts:
             st.caption("; ".join(caption_parts) + ".")
 
+        # Localize each flagged tail's rise to a specific engine by re-running the
+        # same own-baseline method separately on each engine's cruise burn.
+        eng_pct = (
+            _engine_pct_map(df, _ENG_METRIC, AC_COL,
+                            _MIN_BASELINE_FLIGHTS, _AMBER_FACTOR, _RED_FACTOR)
+            if _ENG_METRIC else {}
+        )
+        _OVER_THRESH = (_AMBER_FACTOR - 1.0) * 100.0  # +5%
+
+        def _engine_driver(tail):
+            if not _ENG_METRIC:
+                return "—"
+            p = eng_pct.get(tail, {})
+            e1, e2 = p.get(1), p.get(2)
+            over1 = e1 is not None and e1 > _OVER_THRESH
+            over2 = e2 is not None and e2 > _OVER_THRESH
+            if over1 and over2:
+                return "Both"
+            if over1:
+                return "ENG1"
+            if over2:
+                return "ENG2"
+            return "—"
+
         disp = pd.DataFrame({
             "Aircraft": top["Aircraft"].map(_dnm),
             "Status": top["Status"],
+            "Engine driving rise": top["Aircraft"].map(_engine_driver),
             f"Recent {_UNIT}": top["Recent"],
             f"Own baseline {_UNIT}": top["Baseline"],
             "% above": top["pct_above"],
@@ -529,9 +591,10 @@ else:
         })
 
         def _row_tint(row):
-            if str(row["Status"]).startswith("Critical"):
+            s = str(row["Status"])
+            if s == ">+10%":
                 return ["background-color: rgba(239,68,68,0.15)"] * len(row)
-            if str(row["Status"]).startswith("Monitor"):
+            if s == ">+5%":
                 return ["background-color: rgba(251,191,36,0.15)"] * len(row)
             return [""] * len(row)
 
@@ -545,3 +608,9 @@ else:
             })
         )
         st.dataframe(styled, use_container_width=True, hide_index=True)
+        st.caption(
+            "'Engine driving rise' names the engine(s) more than +5% above their OWN "
+            "cruise-burn baseline — the specific engine to inspect first (e.g. borescope "
+            "ENG2). 'Both' = both engines rising; '—' = the rise is not isolatable to a "
+            "single engine, or per-engine history is too thin."
+        )
