@@ -89,6 +89,151 @@ render_freshest_badge(
     label="TRAX removal/maintenance data",
 )
 
+# ── Fleet Removal Triage (answer-first, full fleet, sidebar-independent) ──────
+RECENCY_DAYS = 30
+
+# Every position-prediction column the producer emits. save_wheel_brake_report_op
+# pd.concat's one frame per position → LONG layout (exactly one prediction_*
+# non-null per row, the row's own gear position). Listed in full so no position
+# is silently dropped from the safety-alert aggregation. Mirror of _POSITIONS.
+_TRIAGE_POS = {
+    "prediction_mlg1":   "MLG 1 — LH Fwd",
+    "prediction_mlg2":   "MLG 2 — LH Aft",
+    "prediction_mlg3":   "MLG 3 — RH Fwd",
+    "prediction_mlg4":   "MLG 4 — RH Aft",
+    "prediction_nlg_lh": "NLG — LH",
+    "prediction_nlg_rh": "NLG — RH",
+}
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def _fleet_removal_triage(recency_days: int):
+    """Full-fleet removal triage from the live report, independent of the sidebar.
+
+    Reuses the cached `load` (no extra Drive round-trip). LONG layout → exactly
+    one prediction_* non-null per row. For each aircraft/position take the LATEST
+    record, then OR-aggregate flags across positions (safety-alert semantics: any
+    flagged position triggers). Recency keys off the report's OWN latest flight
+    date — an in-service E2 flies ~daily, so anchoring to the report (not
+    wall-clock now) survives a paused pipeline and the parquet's known date shift.
+    Aircraft with no flight within `recency_days` are excluded from the actionable
+    list and counted separately, so one stale flight can't become a permanent alert.
+    """
+    rep = load("e2_wnb_report.parquet")
+    if rep.empty or "ac_sn" not in rep.columns or "date" not in rep.columns:
+        return None
+
+    rep = rep.copy()
+    rep["date"] = pd.to_datetime(rep["date"], errors="coerce")
+    rep["ac_sn"] = rep["ac_sn"].astype(str)
+    pmap = make_prefix_map()
+    rep = clean_df(rep, date_col="date", ac_col="ac_sn", prefix_map=pmap)
+    rep = rep.dropna(subset=["date", "ac_sn"])
+    pred_cols = [c for c in _TRIAGE_POS if c in rep.columns]
+    if rep.empty or not pred_cols:
+        return None
+
+    report_latest = rep["date"].max()
+    cutoff = report_latest - pd.Timedelta(days=recency_days)
+    ac_latest = rep.groupby("ac_sn")["date"].max()
+
+    flagged = {}
+    for col in pred_cols:
+        sub = rep[rep[col].notna()]
+        if sub.empty:
+            continue
+        latest = sub.sort_values("date").groupby("ac_sn")[col].last()
+        for ac, val in latest.items():
+            if val == 1:
+                flagged.setdefault(ac, []).append(_TRIAGE_POS[col])
+
+    rows, stale_flagged, pos_counter = [], 0, {}
+    for ac, positions in flagged.items():
+        ac_last = ac_latest.get(ac)
+        if pd.isna(ac_last) or ac_last < cutoff:
+            stale_flagged += 1
+            continue
+        rows.append({
+            "Aircraft": display_name(ac, pmap),
+            "Flagged position(s)": ", ".join(sorted(positions)),
+            "Positions flagged": len(positions),
+            "Latest flight": ac_last.strftime("%d-%b-%Y"),
+            "Action": "Inspect landing gear / brake — ATA 32",
+        })
+        for p in positions:
+            pos_counter[p] = pos_counter.get(p, 0) + 1
+
+    table = pd.DataFrame(rows)
+    if not table.empty:
+        table = table.sort_values("Positions flagged", ascending=False).reset_index(drop=True)
+    worst_pos = max(pos_counter, key=pos_counter.get) if pos_counter else None
+    return {
+        "table": table,
+        "n_aircraft": int(len(table)),
+        "total_positions": int(table["Positions flagged"].sum()) if not table.empty else 0,
+        "worst_pos": worst_pos,
+        "worst_pos_count": pos_counter.get(worst_pos, 0) if worst_pos else 0,
+        "stale_flagged": int(stale_flagged),
+        "recent_fleet": int((ac_latest >= cutoff).sum()),
+    }
+
+
+st.subheader(":material/warning: Fleet Removal Triage — Which Gear to Inspect Next")
+_triage = _fleet_removal_triage(RECENCY_DAYS)
+
+if not _triage:
+    st.info(
+        "Fleet removal triage is unavailable — the model-prediction report "
+        "`e2_wnb_report.parquet` is missing or has no prediction columns yet. "
+        "Run the `save_wheel_brake_report` job in Dagster to populate it."
+    )
+else:
+    t1, t2, t3, t4 = st.columns(4)
+    t1.metric(
+        ":material/build: Aircraft to inspect", _triage["n_aircraft"],
+        help=f"Distinct aircraft with at least one model-predicted removal that flew "
+             f"within {RECENCY_DAYS} days.",
+    )
+    t2.metric(":material/warning: Flagged gear positions", _triage["total_positions"])
+    t3.metric(
+        ":material/build: Worst position", _triage["worst_pos"] or "None",
+        help=f"Position flagged on the most aircraft ({_triage['worst_pos_count']}).",
+    )
+    t4.metric(
+        ":material/schedule: Fleet flying in window", _triage["recent_fleet"],
+        help=f"Aircraft with a flight in the last {RECENCY_DAYS} days (triage denominator).",
+    )
+
+    st.caption(
+        f"Full fleet, independent of the sidebar filter. OR-aggregated across all six gear "
+        f"positions (any flagged position triggers), latest record per aircraft/position, "
+        f"windowed to flights within {RECENCY_DAYS} days of the report's own latest flight date."
+    )
+    if _triage["stale_flagged"]:
+        st.caption(
+            f":material/schedule: {_triage['stale_flagged']} additional aircraft carry a flag "
+            f"but have not flown in {RECENCY_DAYS} days — excluded from the list above so a "
+            "stale flight cannot become a permanent alert."
+        )
+
+    if _triage["n_aircraft"] == 0:
+        st.success(
+            f"No aircraft have a model-predicted removal among the fleet flying in the "
+            f"last {RECENCY_DAYS} days. Nothing to action right now."
+        )
+    else:
+        if _triage["n_aircraft"] > 10:
+            st.caption(
+                f"Top 10 of {_triage['n_aircraft']} flagged aircraft, ranked by positions flagged."
+            )
+        st.dataframe(_triage["table"].head(10), use_container_width=True, hide_index=True)
+        st.caption(
+            "Why these alerts? See :material/analytics: Section 6 — Model Track Record below "
+            "for each per-position model's historical catch rate against confirmed TRAX removals."
+        )
+
+st.divider()
+
 # ── Sidebar controls ──────────────────────────────────────────
 with st.sidebar:
     st.header(":material/insights: Filters")
