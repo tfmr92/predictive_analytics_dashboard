@@ -20,8 +20,6 @@ back to documented calibrated bands — High ≥ 0.60, Watch ≥ 0.45 — and al
 the raw probability so no decision is hostage to the cut.
 """
 
-import os
-
 import numpy as np
 import pandas as pd
 import plotly.express as px
@@ -887,43 +885,19 @@ def _param_trend(dff: pd.DataFrame, col: str, unit: str, bad_dir: str, title: st
 
 
 # ── Confirmed Failures (ACARS-validated ground truth) helper ──────────────────
-_CONFIRMED_TABLE = "e2_sav_confirmed_failures"
-_DB_URI = os.environ.get(
-    "DATABASE_URL",
-    "postgresql+psycopg2://postgres:Airline2024**@localhost:5432/postgres",
-)
+_CONFIRMED_FILE = "e2_sav_confirmed_failures.parquet"
 
 
 @st.cache_data(ttl=300, show_spinner=False)
 def _load_confirmed_failures() -> pd.DataFrame:
-    """Read the project's ground-truth SAV removal validation table.
-
-    Priority: (1) Google Drive parquet — works in cloud deploy;
-              (2) local Postgres — works on-prem.
-    Returns empty DataFrame on any failure so the tab degrades gracefully."""
-    # 1. Try Google Drive parquet (works in Streamlit Cloud)
+    """Read the SAV ground-truth removal validation table via the canonical Drive
+    channel (the same export op the other reports use). Returns an empty DataFrame
+    on any failure so the tab degrades to an honest empty state — no hardcoded
+    Postgres credentials."""
     try:
-        from utils.drive_loader import load as drive_load
-        df = drive_load("e2_sav_confirmed_failures.parquet")
-        if not df.empty:
-            return df
-    except Exception:
-        pass
-
-    # 2. Fallback: on-prem Postgres (local dev)
-    try:
-        from sqlalchemy import create_engine, inspect, text
-        engine = create_engine(_DB_URI)
+        return load(_CONFIRMED_FILE)
     except Exception:
         return pd.DataFrame()
-    try:
-        if not inspect(engine).has_table(_CONFIRMED_TABLE):
-            return pd.DataFrame()
-        return pd.read_sql(text(f"SELECT * FROM {_CONFIRMED_TABLE}"), engine)
-    except Exception:
-        return pd.DataFrame()
-    finally:
-        engine.dispose()
 
 
 # ── Tabs ──────────────────────────────────────────────────────────────────────
@@ -1271,12 +1245,18 @@ with tab_eda:
 # ── Confirmed Failures (ACARS-validated ground truth) ─────────────────────────
 with tab_confirmed:
     st.subheader(":material/verified: ACARS-confirmed SAV removals — ground-truth validation")
+    render_freshest_badge(
+        [_CONFIRMED_FILE], label="ACARS confirmed-failures export", stale_hours=48,
+    )
 
     df_cf = _load_confirmed_failures()
     if df_cf.empty:
         st.info(
-            "No ACARS-validated removal records available yet. Run the SAV "
-            "ground-truth labelling step that populates `e2_sav_confirmed_failures`."
+            "No ACARS-validated removal records available yet. The "
+            "`e2_sav_confirmed_failures.parquet` export is missing, empty, or failed "
+            "to load from Drive — this tab shows real data only, never placeholders. "
+            "It is populated by the SAV ground-truth labelling step (TRAX removals × "
+            "FHDB fault messages)."
         )
     else:
         def _pick(*cands):
@@ -1304,26 +1284,56 @@ with tab_confirmed:
         if c_lead:
             work[c_lead] = pd.to_numeric(work[c_lead], errors="coerce")
 
-        # KPI row — ONLY over rows with fault coverage (gap removals excluded,
-        # never counted as NFF).
+        # ── Validation header: "do the SAV alerts correspond to real removals?" ─
+        # Every stat comes from the parquet's own columns (no prediction-join, no
+        # invented numbers). Rate/lead are over the fault-COVERED sample only —
+        # gap removals (2024→2025 FHDB gap) are excluded, never counted as NFF.
+        n_total = len(work)
         covered = work[work[c_cov]] if c_cov else work.iloc[0:0]
         n_cov = len(covered)
         k_conf = int(covered[c_conf].sum()) if (c_conf and n_cov) else 0
+        small_sample = n_cov < 10
 
-        k1, k2, k3, k4 = st.columns(4)
-        k1.metric("Removals with fault coverage", n_cov)
-        k2.metric("Confirmed by ACARS", k_conf)
-        if n_cov >= 5:
-            k3.metric("Confirmation rate", f"{100 * k_conf / n_cov:.0f}%")
+        st.markdown("**Do the SAV alerts correspond to real removals?**")
+        h1, h2, h3 = st.columns(3)
+        h1.metric(
+            "SAV removals (TRAX)", n_total,
+            help="Total starter-air-valve removals on record — the full ground-truth "
+                 "population this validation is measured against.",
+        )
+        if c_conf and n_cov:
+            rate_note = ("Small confirmed-event sample (N<10) — treat the rate as "
+                         "indicative, not statistical." if small_sample
+                         else "Rate is over the fault-covered confirmed-event sample.")
+            h2.metric(
+                "Confirmed by ACARS",
+                f"{k_conf}/{n_cov} · {100 * k_conf / n_cov:.0f}%",
+                delta="small sample" if small_sample else None,
+                delta_color="off",
+                help="Removals with a matching FIM SAV fault message within 30 days, "
+                     "over the removals that have FHDB fault coverage. " + rate_note,
+            )
         else:
-            k3.metric("Confirmation rate", "—",
-                      help="Suppressed — fewer than 5 removals with fault coverage.")
+            h2.metric("Confirmed by ACARS", "—",
+                      help="No removals with FHDB fault coverage to rate yet.")
         if c_lead and k_conf:
             med_lead = covered.loc[covered[c_conf], c_lead].median()
-            k4.metric("Median lead time",
-                      "—" if pd.isna(med_lead) else f"{med_lead:.0f} d")
+            h3.metric(
+                "Median lead time (ground truth)",
+                "—" if pd.isna(med_lead) else f"{med_lead:.0f} d",
+                help="Days from the FIRST fault message to the removal — an observed "
+                     "fault→removal horizon, NOT the model's prediction precision.",
+            )
         else:
-            k4.metric("Median lead time", "—")
+            h3.metric("Median lead time (ground truth)", "—")
+
+        st.caption(
+            "How to read this: the confirmation **rate** is over a small fault-covered "
+            "event sample (flagged when N<10) — indicative, not statistical. The "
+            "**median lead time** is GROUND TRUTH — the first fault message precedes "
+            "the removal — and is NOT the model's prediction precision. The transient "
+            "SAV model's honest track record is event-level GroupKFold **AUC 0.74**."
+        )
 
         def _eng_label(v):
             s = str(v).strip().upper()
