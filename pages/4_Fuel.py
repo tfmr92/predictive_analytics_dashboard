@@ -173,17 +173,56 @@ def _build_cruise_watchlist(df_in, metric, ac_col, min_flights, amber, red):
     return pd.DataFrame(rows), n_excluded
 
 
+# Shift of the ENG1−ENG2 asymmetry must exceed this many robust flight-to-flight
+# scatters of that same asymmetry before it is attributed to one engine.
+_ASYM_NOISE_K = 1.0
+
+
 @st.cache_data(ttl=300)
-def _engine_pct_map(df_in, eng_metric, ac_col, min_flights, amber, red):
-    """Recent %-above-own-baseline per engine, reusing _build_cruise_watchlist on
-    each engine's own cruise-burn metric. Returns {tail: {eng_n: pct_above}}."""
+def _engine_asymmetry_map(df_in, eng_metric, ac_col, min_flights):
+    """Attribute a rising cruise burn to a SINGLE engine via the ENG1-vs-ENG2 burn-rate
+    ASYMMETRY (asym = ENG1_rate - ENG2_rate per flight). Because both engines fly the
+    SAME weight, altitude and wind on each flight, their per-flight difference cancels
+    those shared confounders — so a SHIFT of that difference away from the tail's own
+    early baseline, beyond the asymmetry's own flight-to-flight noise, isolates the
+    diverging engine. This is the physically honest per-engine signal: the previous
+    per-engine own-baseline fired on EVERY engine whenever the aircraft simply flew
+    heavier/higher (both burning more together), spuriously reading 'Both'.
+
+    Returns {tail: {label, shift, thresh, base, recent, n}} where label is ENG1 / ENG2 /
+    '—' and shift is the signed (ENG1−ENG2) move: positive → ENG1 diverging."""
+    if 1 not in eng_metric or 2 not in eng_metric:
+        return {}
+    m1, m2 = eng_metric[1], eng_metric[2]
+    d = df_in.dropna(subset=["date", m1, m2, ac_col]).copy()
+    d["_asym"] = pd.to_numeric(d[m1], errors="coerce") - pd.to_numeric(d[m2], errors="coerce")
+    d = d.dropna(subset=["_asym"])
     out: dict = {}
-    for eng_n, mcol in eng_metric.items():
-        wl_eng, _ = _build_cruise_watchlist(
-            df_in[["date", mcol, ac_col]], mcol, ac_col, min_flights, amber, red,
-        )
-        for _, r in wl_eng.iterrows():
-            out.setdefault(r["Aircraft"], {})[eng_n] = float(r["pct_above"])
+    for tail, g in d.groupby(ac_col):
+        g = g.sort_values("date")
+        n = len(g)
+        n_base = min(n, max(min_flights, int(np.ceil(n * 0.30))))
+        recent_n = min(min_flights, n)
+        # Same temporal separation as the total-burn watchlist: baseline and recent
+        # windows must not overlap, otherwise a diverging tail hides its own shift.
+        if n < n_base + recent_n:
+            continue
+        asym = g["_asym"].to_numpy()
+        base = float(np.median(asym[:n_base]))
+        recent = float(np.mean(asym[-recent_n:]))
+        shift = recent - base
+        # Robust flight-to-flight scatter of the asymmetry = its own noise floor.
+        mad = float(np.median(np.abs(asym - np.median(asym))))
+        noise = 1.4826 * mad
+        thresh = max(_ASYM_NOISE_K * noise, 1e-9)
+        if shift > thresh:
+            label = "ENG1"
+        elif shift < -thresh:
+            label = "ENG2"
+        else:
+            label = "—"
+        out[tail] = {"label": label, "shift": shift, "thresh": thresh,
+                     "base": base, "recent": recent, "n": n}
     return out
 
 
@@ -556,34 +595,26 @@ else:
         if caption_parts:
             st.caption("; ".join(caption_parts) + ".")
 
-        # Localize each flagged tail's rise to a specific engine by re-running the
-        # same own-baseline method separately on each engine's cruise burn.
-        eng_pct = (
-            _engine_pct_map(df, _ENG_METRIC, AC_COL,
-                            _MIN_BASELINE_FLIGHTS, _AMBER_FACTOR, _RED_FACTOR)
-            if _ENG_METRIC else {}
+        # Isolate WHICH engine to inspect via the ENG1−ENG2 cruise-burn asymmetry
+        # shift — the per-flight delta cancels the weight/altitude/wind confounders
+        # both engines see together, unlike the per-engine own-baseline that fired
+        # 'Both' whenever the aircraft simply flew heavier/higher.
+        asym_map = (
+            _engine_asymmetry_map(df, _ENG_METRIC, AC_COL, _MIN_BASELINE_FLIGHTS)
+            if len(_ENG_METRIC) >= 2 else {}
         )
-        _OVER_THRESH = (_AMBER_FACTOR - 1.0) * 100.0  # +5%
 
-        def _engine_driver(tail):
-            if not _ENG_METRIC:
+        def _engine_diverging(tail):
+            info = asym_map.get(tail)
+            if not info or info["label"] == "—":
                 return "—"
-            p = eng_pct.get(tail, {})
-            e1, e2 = p.get(1), p.get(2)
-            over1 = e1 is not None and e1 > _OVER_THRESH
-            over2 = e2 is not None and e2 > _OVER_THRESH
-            if over1 and over2:
-                return "Both"
-            if over1:
-                return "ENG1"
-            if over2:
-                return "ENG2"
-            return "—"
+            sign = "+" if info["shift"] >= 0 else "−"
+            return f"{info['label']}  {sign}{abs(info['shift']):.0f} {_UNIT}"
 
         disp = pd.DataFrame({
             "Aircraft": top["Aircraft"].map(_dnm),
             "Status": top["Status"],
-            "Engine driving rise": top["Aircraft"].map(_engine_driver),
+            "Engine diverging (ENG1−ENG2 shift)": top["Aircraft"].map(_engine_diverging),
             f"Recent {_UNIT}": top["Recent"],
             f"Own baseline {_UNIT}": top["Baseline"],
             "% above": top["pct_above"],
@@ -609,8 +640,73 @@ else:
         )
         st.dataframe(styled, use_container_width=True, hide_index=True)
         st.caption(
-            "'Engine driving rise' names the engine(s) more than +5% above their OWN "
-            "cruise-burn baseline — the specific engine to inspect first (e.g. borescope "
-            "ENG2). 'Both' = both engines rising; '—' = the rise is not isolatable to a "
-            "single engine, or per-engine history is too thin."
+            "'Engine diverging (ENG1−ENG2 shift)' isolates which engine to inspect first "
+            "from the per-flight ENG1−ENG2 cruise-burn-rate difference. Both engines fly "
+            "the SAME weight, altitude and wind on each flight, so their difference cancels "
+            "those shared confounders — a shift of that difference away from the tail's own "
+            "early baseline, beyond its flight-to-flight noise, points to the diverging "
+            "engine (e.g. borescope ENG2). The signed value is the (ENG1−ENG2) shift "
+            "magnitude: positive → ENG1 diverging, negative → ENG2. '—' means symmetric — "
+            "the rise is NOT isolatable to one engine (both burning more together, as a "
+            "heavier/higher flight causes) rather than a hidden confounder being attributed "
+            "to a single engine."
         )
+
+        # Which-engine evidence: per-engine cruise-burn rate over time for the single
+        # worst-flagged tail, with the gap between the two engines shaded so the
+        # divergence that drives the ENGx recommendation is visible, not a lone word.
+        if len(_ENG_METRIC) >= 2:
+            worst_tail = wl_sorted.iloc[0]["Aircraft"]
+            m1, m2 = _ENG_METRIC[1], _ENG_METRIC[2]
+            gw = (
+                df[df[AC_COL] == worst_tail]
+                .dropna(subset=["date", m1, m2])
+                .sort_values("date")
+            )
+            if len(gw) >= 2:
+                st.markdown(
+                    f"**Which engine is diverging — {_dnm(worst_tail)} "
+                    "(worst flagged tail)**"
+                )
+                info = asym_map.get(worst_tail, {})
+                fig_asym = go.Figure()
+                fig_asym.add_trace(go.Scatter(
+                    x=gw["date"], y=gw[m1], mode="lines+markers",
+                    name="ENG1 cruise-burn rate",
+                    line=dict(color="#3b82f6", width=2), marker=dict(size=5),
+                    hovertemplate="ENG1 %{x|%d-%b-%y}: %{y:.0f} " + _UNIT + "<extra></extra>",
+                ))
+                # fill='tonexty' shades the area between ENG2 and ENG1 = the divergence.
+                fig_asym.add_trace(go.Scatter(
+                    x=gw["date"], y=gw[m2], mode="lines+markers",
+                    name="ENG2 cruise-burn rate",
+                    line=dict(color="#f97316", width=2), marker=dict(size=5),
+                    fill="tonexty", fillcolor="rgba(148,163,184,0.22)",
+                    hovertemplate="ENG2 %{x|%d-%b-%y}: %{y:.0f} " + _UNIT + "<extra></extra>",
+                ))
+                fig_asym.update_layout(
+                    title=f"{_dnm(worst_tail)} — per-engine cruise-burn rate "
+                          "(shaded gap = ENG1−ENG2 divergence)",
+                    xaxis_title="", yaxis_title=_Y_TITLE,
+                    height=340,
+                    xaxis=dict(tickformat="%d-%b-%y"),
+                    legend=dict(orientation="h", yanchor="bottom", y=1.02,
+                                xanchor="right", x=1),
+                )
+                st.plotly_chart(fig_asym, use_container_width=True)
+                if info and info.get("label", "—") != "—":
+                    st.caption(
+                        f"ENG1−ENG2 asymmetry shifted from a baseline of "
+                        f"{info['base']:+.0f} {_UNIT} to {info['recent']:+.0f} {_UNIT} "
+                        f"recently — a {info['shift']:+.0f} {_UNIT} move beyond its "
+                        f"{info['thresh']:.1f} {_UNIT} noise band, isolating "
+                        f"{info['label']} as the diverging engine → inspect "
+                        f"{info['label']} first."
+                    )
+                else:
+                    st.caption(
+                        "Both engine rates track together with no baseline-beating "
+                        "divergence — the rise is symmetric, so it is not isolatable to a "
+                        "single engine here (consistent with a heavier/higher flight, not "
+                        "one-engine degradation)."
+                    )
