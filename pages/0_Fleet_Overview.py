@@ -360,6 +360,61 @@ sav_rh_alert = _sav_transient_alert(data["sav_rh"])
 # assertion so a coverage collapse fails loud, never as silent zero-alerts.
 n_sav_cov = len(set(sav_lh_alert) | set(sav_rh_alert))
 
+# Monte Carlo RUL horizon (E2 SAV) — the same days-to-removal parquets 1_SAV.py trusts
+# (median + P10/P90 from estimate_rul_op). Keyed on ac_sn normalized IDENTICALLY to
+# _sav_transient_alert (line 334) so the keys join sav_lh_alert / sav_rh_alert. Purely
+# additive: if a parquet is missing or a tail has no RUL, the banner keeps its current
+# text — the SAV alert logic itself is untouched.
+_RUL_COLS = ("rul_median_days", "rul_p10_days", "rul_p90_days")
+
+
+@st.cache_data(ttl=300)
+def _load_sav_rul(filename: str) -> dict:
+    try:
+        df = load(filename)
+    except Exception:
+        return {}
+    if df is None or df.empty or "ac_sn" not in df.columns:
+        return {}
+    d = df[["ac_sn"] + [c for c in _RUL_COLS if c in df.columns]].copy()
+    d["ac_sn"] = (
+        d["ac_sn"].astype(str).str.strip().str.replace(r"\.0$", "", regex=True)
+    )
+    for c in _RUL_COLS:
+        if c in d.columns:
+            d[c] = pd.to_numeric(d[c], errors="coerce")
+    d = d.drop_duplicates("ac_sn").set_index("ac_sn")
+    return {
+        ac: {
+            "med": row.get("rul_median_days", float("nan")),
+            "p10": row.get("rul_p10_days", float("nan")),
+            "p90": row.get("rul_p90_days", float("nan")),
+        }
+        for ac, row in d.iterrows()
+    }
+
+
+rul_lh_by_ac = _load_sav_rul("e2_sav_transient_rul_lh.parquet")
+rul_rh_by_ac = _load_sav_rul("e2_sav_transient_rul_rh.parquet")
+
+
+# Mirrors 1_SAV.py _action_table's RUL semantics (lines 563-571): a positive median
+# becomes a scheduling window, exactly 0 means at/above threshold now, NaN/absent adds
+# nothing. Returns a leading-space suffix so it appends cleanly onto the banner line.
+def _sav_rul_suffix(rul_by_ac: dict, msn: str) -> str:
+    rul = rul_by_ac.get(msn)
+    if not rul:
+        return ""
+    med = rul.get("med", float("nan"))
+    if pd.isna(med):
+        return ""
+    if med == 0:
+        return " · horizon: at/above threshold now"
+    p10, p90 = rul.get("p10", float("nan")), rul.get("p90", float("nan"))
+    lo = f"{int(round(p10))}" if pd.notna(p10) else "?"
+    hi = f"{int(round(p90))}" if pd.notna(p90) else "?"
+    return f" · est. ~{int(round(med))} d to removal [{lo}-{hi} d]"
+
 # Oxygen
 oxy_ac_col = next((c for c in ("aircraftSerNum-1", "ac_sn") if c in data["oxy"].columns), None)
 oxy_psi: dict = {}
@@ -546,9 +601,15 @@ immediate_items = []
 
 for msn in all_e2:
     if sav_lh_alert.get(msn) == 1:
-        immediate_items.append(f"**{_dnm(msn)}** — SAV LH: predicted pre-failure (check ATS valve ATA 80)")
+        immediate_items.append(
+            f"**{_dnm(msn)}** — SAV LH: predicted pre-failure (check ATS valve ATA 80)"
+            + _sav_rul_suffix(rul_lh_by_ac, msn)
+        )
     if sav_rh_alert.get(msn) == 1:
-        immediate_items.append(f"**{_dnm(msn)}** — SAV RH: predicted pre-failure (check ATS valve ATA 80)")
+        immediate_items.append(
+            f"**{_dnm(msn)}** — SAV RH: predicted pre-failure (check ATS valve ATA 80)"
+            + _sav_rul_suffix(rul_rh_by_ac, msn)
+        )
     if oxy_alert.get(msn) == 2:
         psi = oxy_psi.get(msn, 0)
         immediate_items.append(f"**{_dnm(msn)}** — Oxygen: {psi:.0f} PSI < {PSI_AMBER} PSI — no dispatch, QRH action required (ATA 35)")
