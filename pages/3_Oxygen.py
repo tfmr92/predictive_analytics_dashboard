@@ -52,6 +52,16 @@ if AC_COL:
 DISP_COL = "_display" if "_display" in df.columns else AC_COL
 AC_COL = DISP_COL  # all charts/groupbys use the display name from here on
 
+# Report-through date: the latest reading date present in the loaded report.
+# Forecasts anchor projected calendar dates on THIS date, not on wall-clock "today",
+# so a frozen pipeline cannot silently slide the O2-servicing forecast forward.
+# Captured before the history-window / aircraft filters so it reflects the whole report.
+LAST_DATA_DATE = (
+    df["date"].max().normalize()
+    if "date" in df.columns and df["date"].notna().any()
+    else None
+)
+
 # ── Pre-compute alerted aircraft (before sidebar so we can show count) ────────
 all_ac = sorted(df[DISP_COL].dropna().unique().tolist()) if AC_COL else []
 alerted_msns: list = []
@@ -448,10 +458,17 @@ if "psi" in df.columns and "delta_press" in df.columns and AC_COL:
         "span) for the date projection, requiring a minimum of 4 readings; the immediate "
         "below-845 PSI alert is evaluated for every aircraft regardless."
     )
+    if LAST_DATA_DATE is not None:
+        st.caption(
+            f"Projected calendar dates are anchored on the latest data date in the report "
+            f"(**data through {LAST_DATA_DATE:%d-%b-%Y}**), not on today's date — so a stalled "
+            "pipeline does not slide the servicing forecast forward."
+        )
 
     MIN_FORECAST_FLIGHTS = 4
 
-    today = pd.Timestamp.now().normalize()
+    # Anchor projected dates on the report's latest data date (not wall-clock now).
+    anchor_date = LAST_DATA_DATE
     forecast_rows = []
 
     for msn, grp in df.dropna(subset=["psi", "delta_press", AC_COL]).groupby(AC_COL):
@@ -466,8 +483,12 @@ if "psi" in df.columns and "delta_press" in df.columns and AC_COL:
         if enough_readings and daily_rate > 0:
             days_to_cyan  = max(0, (current_psi - PSI_CYAN)  / daily_rate)
             days_to_amber = max(0, (current_psi - PSI_AMBER) / daily_rate)
-            est_amber_date = today + pd.Timedelta(days=days_to_amber)
-            est_amber_str  = est_amber_date.strftime("%d-%b-%Y")
+            if anchor_date is not None:
+                est_amber_date = anchor_date + pd.Timedelta(days=days_to_amber)
+                est_amber_str  = est_amber_date.strftime("%d-%b-%Y")
+            else:
+                est_amber_date = None
+                est_amber_str  = "—"
         else:
             days_to_cyan  = float("inf")
             days_to_amber = float("inf")
@@ -512,7 +533,8 @@ if "psi" in df.columns and "delta_press" in df.columns and AC_COL:
             ]
             st.warning(
                 f"**Plan maintenance within {planning_horizon} days** — forecast to cross "
-                f"the {PSI_AMBER} PSI amber threshold:\n" + "\n".join(lines)
+                f"the {PSI_AMBER} PSI amber threshold "
+                f"(projected from data through {LAST_DATA_DATE:%d-%b-%Y}):\n" + "\n".join(lines)
             )
         if immediate.empty and upcoming.empty:
             st.success(
@@ -691,20 +713,23 @@ st.caption(
     "of its own per-flight drop distribution**, scaled to a per-day rate by the aircraft's "
     "flights/day — giving an *earliest / latest* crossing window instead of a single point ETA. "
     "The shaded cone is an uncertainty **envelope**, NOT a 95% confidence interval. "
-    "Projection assumes no recharge."
+    "Projection assumes no recharge. Crossing dates are anchored on the report's latest "
+    "data date, not on today, so a stalled pipeline does not slide the window forward."
 )
 
 _MIN_LEAK_OBS = 6  # min positive per-flight leak readings before quantiles are trustworthy
 
 
 @st.cache_data(ttl=300)
-def _build_depletion_cone(df_in, ac_col):
+def _build_depletion_cone(df_in, ac_col, anchor):
     """Per-aircraft P25/P50/P75 leak-rate projection to the 845 PSI amber limit.
 
     Per-flight drop quantiles are scaled to a per-calendar-day rate (× flights/day)
-    so the projection is expressed in days.
+    so the projection is expressed in days. Crossing calendar dates are anchored on
+    ``anchor`` (the report's latest data date), not on wall-clock now.
     """
-    today = pd.Timestamp.now().normalize()
+    if anchor is None:
+        return {}
     out: dict = {}
     base = df_in.dropna(subset=["psi", "delta_press", "date", ac_col]).sort_values("date")
     for tail, grp in base.groupby(ac_col):
@@ -734,9 +759,9 @@ def _build_depletion_cone(df_in, ac_col):
             "earliest_days": d_fast,                          # steep leak crosses soonest
             "expected_days": d_med,
             "latest_days": d_slow,                            # gentle leak crosses latest
-            "earliest_date": today + pd.Timedelta(days=d_fast),
-            "expected_date": today + pd.Timedelta(days=d_med),
-            "latest_date": today + pd.Timedelta(days=d_slow),
+            "earliest_date": anchor + pd.Timedelta(days=d_fast),
+            "expected_date": anchor + pd.Timedelta(days=d_med),
+            "latest_date": anchor + pd.Timedelta(days=d_slow),
             "history": grp[["date", "psi"]].tail(15).copy(),
         }
     return out
@@ -745,7 +770,7 @@ def _build_depletion_cone(df_in, ac_col):
 _have_cols = all(c in df.columns for c in ("psi", "delta_press", "date")) and bool(AC_COL)
 
 if _have_cols and not df.empty:
-    cone = _build_depletion_cone(df[[AC_COL, "date", "psi", "delta_press"]], AC_COL)
+    cone = _build_depletion_cone(df[[AC_COL, "date", "psi", "delta_press"]], AC_COL, LAST_DATA_DATE)
 
     if not cone:
         st.info(
@@ -765,7 +790,8 @@ if _have_cols and not df.empty:
         )
 
         info = cone[sel_tail]
-        today = pd.Timestamp.now().normalize()
+        # Rays start at the report's latest data date (same anchor as the crossing dates).
+        today = LAST_DATA_DATE
         current_psi = info["current_psi"]
         slow, fast = info["slow"], info["fast"]
         earliest_date, expected_date, latest_date = (
@@ -845,7 +871,8 @@ if _have_cols and not df.empty:
             f"MSN {sel_tail} forecast to cross the {PSI_AMBER} PSI no-dispatch threshold "
             f"between {earliest_date:%d-%b-%Y} and {latest_date:%d-%b-%Y} "
             f"(expected {expected_date:%d-%b-%Y}), from the P25–P75 spread of its own per-flight "
-            "drop (scaled to per day); projection assumes no recharge."
+            f"drop (scaled to per day); projected from data through {LAST_DATA_DATE:%d-%b-%Y}, "
+            "assuming no recharge."
         )
         if info["earliest_days"] <= 30:
             st.warning(_forecast_msg)
