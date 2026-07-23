@@ -918,14 +918,48 @@ for fleet_key, fleet_label in [("a320", "A320"), ("a330", "A330")]:
                 "No A320 aircraft available to build the health matrix in the selected window."
             )
 
-# ── Executive export ──────────────────────────────────────────────────────────
+# ── Executive fleet report export ─────────────────────────────────────────────
+# Consolidated multi-fleet health matrix (E2 + A320) captured from the SAME frames
+# rendered above BEFORE any top-N display cap, with columns reconciled across fleets
+# (outer-union, missing system columns filled with a literal '—') so the CSV is never
+# ragged. A330 is FOQA-chart-only (no per-aircraft health matrix) and is called out
+# below so an absent A330 block is never read as missing data.
 st.divider()
-st.subheader(":material/download: Export fleet status")
+st.subheader(":material/download: Executive fleet report")
 st.caption(
-    "Download the combined E2 + A320 health matrix as a CSV for the morning "
-    "maintenance meeting — the same per-aircraft statuses shown above, one row "
-    "per aircraft."
+    "Download the complete per-aircraft health matrix across every fleet and every "
+    "monitored system as a single CSV for the morning maintenance meeting — the full "
+    "frames shown above, before any top-N display cap, one row per aircraft."
 )
+
+# Preferred, deterministic column order; any extra column is appended after these.
+_EXPORT_COL_ORDER = [
+    "Fleet", "Aircraft", "Overall",
+    "SAV LH", "SAV RH", "SAV", "Oxygen", "FOQA", "W&B", "Fuel",
+]
+
+
+def _reconcile_matrices(parts: list[pd.DataFrame]) -> pd.DataFrame:
+    """Outer-union the per-fleet matrices into one non-ragged frame: unified column
+    order, missing system columns filled with a literal '—' (never a blank that could
+    be read as missing data)."""
+    union: list = []
+    for part in parts:
+        for col in part.columns:
+            if col not in union:
+                union.append(col)
+    ordered = [c for c in _EXPORT_COL_ORDER if c in union]
+    ordered += [c for c in union if c not in ordered]
+    aligned = [part.reindex(columns=ordered, fill_value="—") for part in parts]
+    return pd.concat(aligned, ignore_index=True)
+
+
+@st.cache_data(ttl=300)
+def _encode_export_csv(_df: pd.DataFrame, sig: tuple) -> bytes:
+    # Cached on the light `sig` (row count + column names); `_df` is excluded from
+    # hashing (leading underscore) so the mutated frame is never hashed in full.
+    return _df.to_csv(index=False).encode("utf-8")
+
 
 _export_parts = []
 if not df_matrix.empty:
@@ -938,16 +972,39 @@ if not df_a320_matrix.empty:
     _export_parts.append(_a320_exp)
 
 if _export_parts:
-    df_export = pd.concat(_export_parts, ignore_index=True)
+    df_export = _reconcile_matrices(_export_parts)
+    _sig = (len(df_export), tuple(df_export.columns))
     st.download_button(
-        ":material/download: Export fleet status (CSV)",
-        data=df_export.to_csv(index=False).encode("utf-8"),
-        file_name=f"fleet_status_{datetime.now():%Y%m%d_%H%M}.csv",
+        ":material/download: Download executive fleet report (CSV)",
+        data=_encode_export_csv(df_export, _sig),
+        file_name=f"executive_fleet_report_{datetime.now():%Y%m%d_%H%M}.csv",
         mime="text/csv",
+        key="fleet_exec_report_dl",
     )
+    # Honest scope note: which selected fleets contribute no health-matrix rows, so an
+    # absent block in the CSV is never mistaken for missing/blanked data.
+    _with_matrix = {p["Fleet"].iloc[0] for p in _export_parts}
+    _notes = []
+    if "A330" in fleet_filter:
+        _notes.append(
+            "A330 is monitored via FOQA exceedance charts only (no per-aircraft "
+            "health matrix), so it is not part of this export"
+        )
+    for _f in ("E2", "A320"):
+        if _f in fleet_filter and _f not in _with_matrix:
+            _notes.append(
+                f"{_f} produced no health-matrix rows in the current window "
+                "(no data, not an export error)"
+            )
+    if _notes:
+        st.caption(
+            f":material/info: Scope — {'; '.join(_notes)}. "
+            f"Fleets exported: {', '.join(sorted(_with_matrix))}."
+        )
 else:
-    st.caption(
-        "No fleet-status rows are available in the current window to export."
+    st.info(
+        "No fleet-status rows are available in the current window to export. "
+        "Adjust the fleet filter or expand the history window in the sidebar."
     )
 
 # ── Pipeline health ───────────────────────────────────────────────────────────
