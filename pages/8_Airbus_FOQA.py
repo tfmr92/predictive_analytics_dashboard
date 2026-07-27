@@ -205,6 +205,109 @@ def _fleet_exceedance_summary(df_a320: pd.DataFrame, df_a330: pd.DataFrame, days
     )
     return kpi, top
 
+
+@st.cache_data(ttl=300)
+def _fleet_triage(df: pd.DataFrame, fleet_key: str, window_days: int):
+    """Single-fleet 'which aircraft to inspect next' triage over the FULL fleet.
+
+    Computed over every aircraft of the selected type in the window (no sidebar
+    subset inherited). Enumerates EVERY ATA-05 flag the producer emits (_FLAG_SPEC),
+    ranks aircraft by worst-flag severity (Limit > Advisory), then normalized margin
+    beyond limit, then breaching-flight count. Returns (kpi, top10, worst) where kpi
+    holds aircraft-with-exceedance / total-flag-events / window-flight counts and
+    worst is the single fleet-wide parameter furthest beyond its certified limit."""
+    kpi = {"aircraft": 0, "events": 0, "flights": 0, "window_flights": 0}
+    worst = None
+    if df.empty or "date" not in df.columns:
+        return kpi, pd.DataFrame(), worst
+    cutoff = pd.Timestamp.now() - pd.Timedelta(days=window_days)
+    sub = df[df["date"] >= cutoff]
+    kpi["window_flights"] = int(len(sub))
+    flag_keys = [s["key"] for s in _FLAG_SPEC if s["key"] in sub.columns]
+    if sub.empty or not flag_keys:
+        return kpi, pd.DataFrame(), worst
+    flag_bool = sub[flag_keys].fillna(False).astype(bool)
+    breach_any = flag_bool.any(axis=1)
+    kpi["flights"] = int(breach_any.sum())
+    kpi["aircraft"] = int(sub.loc[breach_any, AC_COL].nunique())
+    kpi["events"] = int(flag_bool.to_numpy().sum())
+    limits = _FLEET_LIMITS.get(fleet_key, {})
+    today = pd.Timestamp.now().normalize()
+
+    rows = []
+    for ac, g in sub.groupby(AC_COL):
+        cand = []
+        for s in _FLAG_SPEC:
+            if s["key"] not in g.columns:
+                continue
+            bm = g[s["key"]].fillna(False).astype(bool)
+            n = int(bm.sum())
+            if n == 0:
+                continue
+            gb = g[bm]
+            val = None
+            vcols = [c for c in s["value_cols"] if c in gb.columns]
+            if vcols:
+                vv = gb[vcols].apply(pd.to_numeric, errors="coerce")
+                series = vv.min(axis=1) if s["direction"] == "down" else vv.max(axis=1)
+                if series.notna().any():
+                    val = float(series.min() if s["direction"] == "down" else series.max())
+            limit = limits.get(s["limit_key"]) if s["limit_key"] else None
+            margin = (val - limit) if (val is not None and limit is not None) else None
+            if margin is not None and limit not in (None, 0):
+                norm = margin / abs(limit) if s["direction"] == "up" else -margin / abs(limit)
+            else:
+                norm = None
+            cand.append({
+                "sev": 2 if s["severity"] == "Limit" else 1,
+                "has_num": 1 if margin is not None else 0,
+                "norm": norm if norm is not None else 0.0,
+                "n": n, "label": s["label"], "value": val, "limit": limit,
+                "margin": margin, "dir": _DIR_ARROW.get(s["direction"], "—"),
+                "phase": s["phase"], "latest": gb["date"].max(),
+            })
+        if not cand:
+            continue
+        # single fleet-wide worst-margin parameter (numeric margins only)
+        for c in cand:
+            if c["has_num"] and (worst is None or c["norm"] > worst["norm"]):
+                worst = {"label": c["label"], "norm": c["norm"], "margin": c["margin"],
+                         "value": c["value"], "limit": c["limit"], "dir": c["dir"],
+                         "aircraft": str(ac)}
+        w = max(cand, key=lambda c: (c["sev"], c["has_num"], c["norm"], c["n"]))
+        tb = int(g[flag_keys].fillna(False).astype(bool).any(axis=1).sum())
+        latest = w["latest"]
+        if pd.notna(latest):
+            days_ago = int((today - latest.normalize()).days)
+            recency = "today" if days_ago <= 0 else f"{days_ago}d ago"
+            latest_str = latest.strftime("%d-%b-%Y")
+        else:
+            recency, latest_str = "—", "—"
+        rows.append({
+            "_sev": w["sev"], "_norm": w["norm"], "_tb": tb,
+            "Aircraft": str(ac),
+            "Worst parameter": w["label"],
+            "Severity": "Limit" if w["sev"] == 2 else "Advisory",
+            "Value": _fmt_num(w["value"]),
+            "Limit": _fmt_num(w["limit"]),
+            "Margin": f"{w['margin']:+.2f}" if w["margin"] is not None else "—",
+            "Dir": w["dir"],
+            "Breaching flights": w["n"],
+            "Driving phase": w["phase"],
+            "Latest breach": latest_str,
+            "Recency": recency,
+        })
+    if not rows:
+        return kpi, pd.DataFrame(), worst
+    top = (
+        pd.DataFrame(rows)
+        .sort_values(["_sev", "_norm", "_tb"], ascending=False)
+        .head(10)
+        .drop(columns=["_sev", "_norm", "_tb"])
+        .reset_index(drop=True)
+    )
+    return kpi, top, worst
+
 # dashboard column -> list of (limit_key, severity, direction, label)
 _TREND_LIMITS = {
     "n1_vib_max": [
@@ -310,6 +413,78 @@ if df_a330.empty:
 _latest_date = max([d["date"].max() for d in (df_a320, df_a330) if not d.empty], default=None)
 if _latest_date is not None and pd.notna(_latest_date):
     st.caption(f"Data through {_latest_date.strftime('%d-%b-%Y')} · auto-refreshed hourly")
+
+# ── Fleet Exceedance Triage — which aircraft to inspect next ────────────────────
+# Additive top-of-page section: fleet is a filter. Pick ONE Airbus type and triage
+# its FULL aircraft set (independent of the sidebar) against that type's certified
+# limits. Everything below this divider is unchanged.
+st.subheader(":material/emergency: Fleet Exceedance Triage")
+st.caption(
+    "Select one Airbus fleet to rank its aircraft by the worst ATA-05 exceedance in "
+    "the window. Fleet is a filter: each type is triaged over its FULL aircraft set "
+    "against its own certified limits — answering which aircraft to inspect next."
+)
+
+_triage_fleets = [
+    t for t in [("A320/A321", "A320FAM", df_a320), ("A330", "A330", df_a330)]
+    if not t[2].empty
+]
+
+_tsel_col, _twin_col = st.columns([2, 1])
+with _tsel_col:
+    _tsel = st.radio(
+        "Fleet", [t[0] for t in _triage_fleets], horizontal=True, key="triage_fleet",
+    )
+with _twin_col:
+    _twin = st.selectbox(
+        "Window", [30, 60, 90, 180], index=1,
+        format_func=lambda d: f"Last {d} days", key="triage_window",
+    )
+
+_tsel_label, _tsel_key, _tsel_df = next(t for t in _triage_fleets if t[0] == _tsel)
+_tkpi, _ttop, _tworst = _fleet_triage(_tsel_df, _tsel_key, _twin)
+
+_g1, _g2, _g3 = st.columns(3)
+_g1.metric(
+    f"{_tsel_label} aircraft with exceedances", _tkpi["aircraft"],
+    help="Distinct aircraft with at least one ATA-05 exceedance flag in the window",
+)
+_g2.metric(
+    "Total exceedances", f"{_tkpi['events']:,}",
+    help="Every ATA-05 flag event (flight × flag) the producer emitted in the window",
+)
+_g3.metric(
+    "Worst-margin parameter", _tworst["label"] if _tworst else "—",
+    help="Flag furthest beyond its certified limit, normalized by the limit",
+)
+if _tworst:
+    _g3.caption(
+        f"{_tworst['aircraft']} · {_tworst['dir']} {_tworst['margin']:+.2f} "
+        f"vs limit {_fmt_num(_tworst['limit'])}"
+    )
+
+if _tkpi["window_flights"] == 0:
+    st.info(
+        f"No {_tsel_label} flights in the last {_twin} days "
+        f"(latest record: {_tsel_df['date'].max():%d-%b-%Y}). Widen the window above."
+    )
+elif _ttop.empty:
+    st.success(
+        f"No ATA-05 exceedances across the {_tsel_label} fleet in the last {_twin} days."
+    )
+else:
+    st.markdown(
+        f"**Inspect next — top {len(_ttop)} {_tsel_label} aircraft by worst exceedance**"
+    )
+    st.dataframe(_ttop, use_container_width=True, hide_index=True)
+    st.caption(
+        "Ranked by severity (Limit → Advisory), then normalized margin beyond limit, "
+        "then breaching-flight count. Margin is signed value − limit; Dir marks "
+        "↑ above / ↓ below. Flags without a published numeric limit show — and stay "
+        "ranked by severity. EGT/TGT limits are provisional (OEM confirmation pending)."
+    )
+
+st.divider()
 
 # ── Sidebar ───────────────────────────────────────────────────────────────────
 with st.sidebar:
