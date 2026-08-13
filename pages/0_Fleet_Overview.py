@@ -27,20 +27,23 @@ FORECAST_HORIZON_DAYS = 30  # fixed planning horizon for upcoming inspections
 _SAV_HIGH = 0.60          # mirrors 1_SAV.py _THRESHOLD_HIGH — calibrated High band
 _SAV_RECENCY_DAYS = 30    # last_flight_dt must be within this window to alert
 
-# Pipeline sources for the health panel: (label, df_key, report filename, producing Dagster job).
-# 'Last refresh' keys off the Drive mtime of each filename — the producing job runs on a fixed
-# schedule regardless of new flights, so a stale mtime means the job stopped, not that the fleet is idle.
+# Pipeline sources for the health panel: (label, df_key, report filename, producing Dagster job,
+# affected pages). 'Last refresh' keys off the Drive mtime of each filename — the producing job runs
+# on a fixed schedule regardless of new flights, so a stale mtime means the job stopped, not that the
+# fleet is idle. 'Affected pages' names the page(s) whose predictions rely on this source, so a stale
+# alert can point the operator at what to distrust — this Fleet Overview page is always implicitly
+# affected too and is left out of the string since the reader is already here.
 PIPELINE_SOURCES = [
-    ("SAV LH (E2)",         "sav_lh",      "e2_sav_transient_lh_report.parquet", "save_sav_transient_report"),
-    ("SAV RH (E2)",         "sav_rh",      "e2_sav_transient_rh_report.parquet", "save_sav_transient_report"),
-    ("SAV A320 — Eng 1",    "sav_a320_e1", "airbus_sav_eng1_report.parquet",  "save_airbus_sav_report"),
-    ("SAV A320 — Eng 2",    "sav_a320_e2", "airbus_sav_eng2_report.parquet",  "save_airbus_sav_report"),
-    ("Oxygen (E2)",         "oxy",         "e2_oxy_report.parquet",           "save_oxy_report"),
-    ("FOQA E2",             "foqa",        "e2_foqa_report.parquet",          "e2_foqa_moqa_job"),
-    ("A320 FOQA",           "a320",        "airbus_a320_foqa_report.parquet", "airbus_foqa_moqa_job"),
-    ("A330 FOQA",           "a330",        "airbus_a330_foqa_report.parquet", "airbus_foqa_moqa_job"),
-    ("Wheels & Brakes (E2)","wnb",         "e2_wnb_report.parquet",           "save_wheel_brake_report"),
-    ("Fuel (E2)",           "fuel",        "e2_fuel_report.parquet",          "save_fuel_consumption_report"),
+    ("SAV LH (E2)",         "sav_lh",      "e2_sav_transient_lh_report.parquet", "save_sav_transient_report",   "SAV (E2)"),
+    ("SAV RH (E2)",         "sav_rh",      "e2_sav_transient_rh_report.parquet", "save_sav_transient_report",   "SAV (E2)"),
+    ("SAV A320 — Eng 1",    "sav_a320_e1", "airbus_sav_eng1_report.parquet",  "save_airbus_sav_report",         "SAV A320"),
+    ("SAV A320 — Eng 2",    "sav_a320_e2", "airbus_sav_eng2_report.parquet",  "save_airbus_sav_report",         "SAV A320"),
+    ("Oxygen (E2)",         "oxy",         "e2_oxy_report.parquet",           "save_oxy_report",                "Oxygen"),
+    ("FOQA E2",             "foqa",        "e2_foqa_report.parquet",          "e2_foqa_moqa_job",               "FOQA/MOQA (E2)"),
+    ("A320 FOQA",           "a320",        "airbus_a320_foqa_report.parquet", "airbus_foqa_moqa_job",           "Airbus FOQA"),
+    ("A330 FOQA",           "a330",        "airbus_a330_foqa_report.parquet", "airbus_foqa_moqa_job",           "Airbus FOQA"),
+    ("Wheels & Brakes (E2)","wnb",         "e2_wnb_report.parquet",           "save_wheel_brake_report",        "Wheels and Brakes"),
+    ("Fuel (E2)",           "fuel",        "e2_fuel_report.parquet",          "save_fuel_consumption_report",   "Fuel"),
 ]
 
 # ── Load all parquets (each is non-fatal if unavailable) ──────────────────────
@@ -1015,7 +1018,8 @@ _now_utc = pd.Timestamp.now(tz="UTC")
 _health_rows = []
 n_total = len(PIPELINE_SOURCES)
 n_stale = 0
-for label, df_key, filename, producing_job in PIPELINE_SOURCES:
+_stale_notices = []
+for label, df_key, filename, producing_job, affected_pages in PIPELINE_SOURCES:
     df_chk = data.get(df_key, pd.DataFrame())
     mtime = get_file_mtime(filename)
     if mtime is None:
@@ -1023,12 +1027,19 @@ for label, df_key, filename, producing_job in PIPELINE_SOURCES:
         status = "Unavailable"
         refresh = "—"
         n_stale += 1
+        _stale_notices.append(
+            f"{label} has no refresh data available — predictions on {affected_pages} may be outdated"
+        )
     else:
         age_h = (_now_utc - mtime) / pd.Timedelta(hours=1)
         refresh = f"{int(round(age_h))}h ago"
         if age_h > 48:
             status = "Stale"
             n_stale += 1
+            _stale_notices.append(
+                f"{label} has not refreshed in {int(round(age_h))}h — "
+                f"predictions on {affected_pages} may be outdated"
+            )
         elif age_h > 24:
             status = "Aging"
         else:
@@ -1049,13 +1060,12 @@ for label, df_key, filename, producing_job in PIPELINE_SOURCES:
         "Last refresh": refresh,   # Drive mtime age — is the job alive?
         "Last flight": last_flight,  # last event date — secondary data-coverage context
         "Rows": rows,
+        "Affected pages": affected_pages,
     })
 
 if n_stale > 0:
     st.warning(
-        f"{n_stale} of {n_total} data sources have not refreshed in 48h+ — "
-        "the producing job(s) may be stopped; predictions on the affected "
-        "pages may be outdated."
+        "; ".join(_stale_notices) + ". Contact data operations to refresh the pipeline."
     )
 else:
     st.success("All data sources refreshed within 48h.")
