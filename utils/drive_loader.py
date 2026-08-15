@@ -119,6 +119,7 @@ def render_freshness_badge(
     fresh_hours: float = 6,
     stale_hours: float = 48,
     label: str | None = None,
+    impact_message: str | None = None,
 ) -> float | None:
     """Render a Streamlit freshness badge for *filename* from its Drive
     modifiedTime and return the report's age in hours (None when unavailable).
@@ -137,10 +138,13 @@ def render_freshness_badge(
     elif age_h <= stale_hours:
         st.caption(f"{name} refreshed {age_h:.0f}h ago")
     else:
-        st.warning(
+        warning_text = (
             f"{name} not refreshed in {age_h:.0f}h — the producing job may be "
             "stopped; predictions below may be outdated"
         )
+        if impact_message:
+            warning_text += f". {impact_message}"
+        st.warning(warning_text)
     return age_h
 
 
@@ -150,6 +154,7 @@ def render_freshest_badge(
     label: str | None = None,
     fresh_hours: float = 6,
     stale_hours: float = 48,
+    impact_message: str | None = None,
 ) -> float | None:
     """Render a single freshness badge for the most-stale report among *filenames*.
 
@@ -162,10 +167,16 @@ def render_freshest_badge(
     dated = [(f, get_file_mtime(f)) for f in filenames]
     dated = [(f, m) for f, m in dated if m is not None]
     if not dated:
-        return render_freshness_badge(filenames[0], label=label)
+        return render_freshness_badge(
+            filenames[0], label=label, impact_message=impact_message
+        )
     oldest = min(dated, key=lambda pair: pair[1])[0]
     return render_freshness_badge(
-        oldest, fresh_hours=fresh_hours, stale_hours=stale_hours, label=label
+        oldest,
+        fresh_hours=fresh_hours,
+        stale_hours=stale_hours,
+        label=label,
+        impact_message=impact_message,
     )
 
 

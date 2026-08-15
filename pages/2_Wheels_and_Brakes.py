@@ -87,6 +87,11 @@ if "date" in df.columns:
 render_freshest_badge(
     ["e2_wnb_maintenance.parquet", "e2_brake_maintenance.parquet"],
     label="TRAX removal/maintenance data",
+    impact_message=(
+        "A removal-risk alert below may point to an aircraft already serviced "
+        "whose removal record has not yet synced, and recent removals may be "
+        "missing from the maintenance history"
+    ),
 )
 
 # ── Fleet Removal Triage (answer-first, full fleet, sidebar-independent) ──────
