@@ -11,7 +11,7 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
-from utils.drive_loader import load, make_prefix_map, display_name, clean_df, get_file_mtime
+from utils.drive_loader import load, make_prefix_map, display_name, clean_df, get_file_mtime, render_freshest_badge
 
 st.set_page_config(page_title="Fleet Overview", layout="wide")
 
@@ -1013,6 +1013,20 @@ else:
 # ── Pipeline health ───────────────────────────────────────────────────────────
 st.divider()
 st.subheader(":material/health_and_safety: Pipeline health")
+
+# TRAX removal/maintenance is the ground-truth feed for wheel/brake life but is not
+# a Dagster-produced report, so it has no slot in PIPELINE_SOURCES / the loop below —
+# without this badge its outage is invisible on this page. Same helper/impact_message
+# pattern already validated on 2_Wheels_and_Brakes.py.
+render_freshest_badge(
+    ["e2_wnb_maintenance.parquet", "e2_brake_maintenance.parquet"],
+    label="Wheels & Brakes maintenance data (TRAX)",
+    impact_message=(
+        "Wheels & Brakes removal-risk alerts fleet-wide may point to aircraft "
+        "already serviced whose removal record has not yet synced, and recent "
+        "removals may be missing from maintenance history."
+    ),
+)
 
 _now_utc = pd.Timestamp.now(tz="UTC")
 _health_rows = []
