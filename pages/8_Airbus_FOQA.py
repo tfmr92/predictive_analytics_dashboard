@@ -10,7 +10,7 @@ import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
 
-from utils.drive_loader import load, render_freshest_badge
+from utils.drive_loader import load, render_freshest_badge, render_empty_state
 
 st.set_page_config(page_title="Airbus FOQA/MOQA", layout="wide")
 
@@ -399,7 +399,10 @@ df_a320 = _load("airbus_a320_foqa_report.parquet")
 df_a330 = _load("airbus_a330_foqa_report.parquet")
 
 if df_a320.empty and df_a330.empty:
-    st.error("No data yet. Run the `airbus_foqa_moqa_job` in Dagster.")
+    render_empty_state(
+        ["airbus_a320_foqa_report.parquet", "airbus_a330_foqa_report.parquet"],
+        "Airbus FOQA",
+    )
     st.stop()
 
 st.caption(

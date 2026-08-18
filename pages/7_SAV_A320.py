@@ -13,7 +13,7 @@ import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
 
-from utils.drive_loader import load, render_freshest_badge
+from utils.drive_loader import load, render_freshest_badge, render_empty_state
 
 st.set_page_config(page_title="SAV A320 — Starter Air Valve", layout="wide")
 
@@ -56,7 +56,10 @@ df_e1 = _load("airbus_sav_eng1_report.parquet")
 df_e2 = _load("airbus_sav_eng2_report.parquet")
 
 if df_e1.empty and df_e2.empty:
-    st.error("No data yet. Run the `save_airbus_sav_report` job in Dagster.")
+    render_empty_state(
+        ["airbus_sav_eng1_report.parquet", "airbus_sav_eng2_report.parquet"],
+        "SAV A320",
+    )
     st.stop()
 
 # ── Alert history: aircraft that have EVER been in predicted pre-failure ──────

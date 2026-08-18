@@ -180,6 +180,32 @@ def render_freshest_badge(
     )
 
 
+def render_empty_state(filenames: list[str] | str, label: str) -> None:
+    """Render an honest st.info() for a page whose report parquet(s) loaded empty.
+
+    Distinguishes two operator-relevant cases via the same Drive mtime used by
+    render_freshest_badge: the source report was never produced (no known mtime,
+    first run pending) versus it exists but the latest write has zero rows
+    (known mtime, likely a stuck or failed run) — reporting the last-write age
+    in the latter case."""
+    if isinstance(filenames, str):
+        filenames = [filenames]
+    dated = [m for m in (get_file_mtime(f) for f in filenames) if m is not None]
+    if not dated:
+        st.info(
+            f"No data yet. Contact data operations to check the {label} pipeline. "
+            "The source report has not been produced yet."
+        )
+        return
+    mtime = max(dated)
+    age_h = (pd.Timestamp.now(tz="UTC") - mtime) / pd.Timedelta(hours=1)
+    st.info(
+        f"No data yet. Contact data operations to check the {label} pipeline. "
+        f"The source report exists (last written {age_h:.0f}h ago) but currently "
+        "contains no rows -- this may indicate a stuck or failed run."
+    )
+
+
 def clean_df(
     df: pd.DataFrame,
     date_col: str = "date",

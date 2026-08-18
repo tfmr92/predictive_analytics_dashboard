@@ -12,7 +12,7 @@ import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
 
-from utils.drive_loader import load, clean_df, make_prefix_map, display_name
+from utils.drive_loader import load, clean_df, make_prefix_map, display_name, render_freshest_badge, render_empty_state
 
 st.set_page_config(page_title="FOQA / MOQA", layout="wide")
 
@@ -248,10 +248,12 @@ def _n2vib_forecast(df_in, ac_col):
 st.title(":material/monitoring: FOQA / MOQA — ATA 05 Exceedance & Engine Trends")
 st.caption("Engine: ITT, N2 vibration, oil pressure · Aircraft: hard landing, VMO, gear overspeed")
 
+render_freshest_badge(["e2_foqa_report.parquet"], label="FOQA report")
+
 df = load("e2_foqa_report.parquet")
 
 if df.empty:
-    st.info("No FOQA data available yet. The `e2_foqa_moqa_job` pipeline has not processed any files.")
+    render_empty_state(["e2_foqa_report.parquet"], "FOQA/MOQA (E2)")
     st.stop()
 
 if 'date' in df.columns:

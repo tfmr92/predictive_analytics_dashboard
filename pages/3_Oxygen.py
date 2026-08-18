@@ -10,7 +10,7 @@ import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
 
-from utils.drive_loader import load, make_prefix_map, display_name, clean_df, render_freshest_badge
+from utils.drive_loader import load, make_prefix_map, display_name, clean_df, render_freshest_badge, render_empty_state
 
 st.set_page_config(page_title="Oxygen System", layout="wide")
 
@@ -32,7 +32,7 @@ render_freshest_badge(["e2_oxy_report.parquet"], label="Oxygen report")
 df = load("e2_oxy_report.parquet")
 
 if df.empty:
-    st.error("No data yet. Run the `save_oxy_report` job in Dagster.")
+    render_empty_state(["e2_oxy_report.parquet"], "Oxygen")
     st.stop()
 
 AC_COL = next((c for c in ("aircraftSerNum-1", "ac_sn") if c in df.columns), None)

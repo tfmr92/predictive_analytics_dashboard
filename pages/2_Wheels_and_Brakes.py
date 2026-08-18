@@ -14,7 +14,7 @@ import plotly.graph_objects as go
 import numpy as np
 import streamlit as st
 
-from utils.drive_loader import load, make_prefix_map, display_name, clean_df, render_freshest_badge
+from utils.drive_loader import load, make_prefix_map, display_name, clean_df, render_freshest_badge, render_empty_state
 
 st.set_page_config(page_title="Wheels & Brakes", layout="wide")
 
@@ -57,7 +57,7 @@ st.markdown(
 df = load("e2_wnb_report.parquet")
 
 if df.empty:
-    st.error("No data yet. Run the `save_wheel_brake_report` job in Dagster.")
+    render_empty_state(["e2_wnb_report.parquet"], "Wheels & Brakes")
     st.stop()
 
 if "date" in df.columns:

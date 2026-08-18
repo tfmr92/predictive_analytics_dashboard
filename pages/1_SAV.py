@@ -32,6 +32,7 @@ from utils.drive_loader import (
     make_prefix_map,
     display_name,
     render_freshest_badge,
+    render_empty_state,
 )
 
 st.set_page_config(page_title="SAV — Starter Air Valve", layout="wide")
@@ -100,9 +101,9 @@ df_lh = _load_parquet("e2_sav_transient_lh_report.parquet")
 df_rh = _load_parquet("e2_sav_transient_rh_report.parquet")
 
 if df_lh.empty and df_rh.empty:
-    st.error(
-        "No transient-model data yet. Run the `save_sav_transient_report` job in "
-        "Dagster (it scores the fleet from `e2_sav_transient_live_features`)."
+    render_empty_state(
+        ["e2_sav_transient_lh_report.parquet", "e2_sav_transient_rh_report.parquet"],
+        "SAV (E2)",
     )
     st.stop()
 
