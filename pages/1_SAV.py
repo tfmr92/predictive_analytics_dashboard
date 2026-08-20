@@ -964,10 +964,9 @@ with tab_rank:
                 else:
                     st.plotly_chart(fig_rul, use_container_width=True)
     else:
-        st.info(
-            "RUL estimates not yet available — trigger a run of "
-            "`save_sav_transient_report_job` in Dagster to generate them "
-            "(`estimate_rul_op` runs as part of that job)."
+        render_empty_state(
+            ["e2_sav_transient_rul_lh.parquet", "e2_sav_transient_rul_rh.parquet"],
+            "SAV (E2) RUL estimation",
         )
 
 # ── Per-engine driver views ───────────────────────────────────────────────────
