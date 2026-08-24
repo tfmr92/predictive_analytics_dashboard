@@ -381,3 +381,61 @@ Cada entrada representa uma run diária (07:00) com uma melhoria implementada, v
 - Files: `dashboard/pages/6_Fleet_Briefing.py`
 - Rationale: Verified live (not from the stale audit snapshot in memory, which incorrectly claims 3_Oxygen.py/4_Fuel.py/7_SAV_A320.py/8_Airbus_FOQA.py lack freshness badges and that 0_Fleet_Overview.py lacks a pipeline-health panel -- both already exist and are well-built). 6_Fleet_Briefing.py is the one Tier-1 gap that IS still real: I read the current file and confirmed all three leaks and the bare warning are still present, because the three prior fix attempts (2026-08-17, 2026-08-18, 2026-08-20) were each reverted for low value (4, 5, 5) -- every one of them was a pure reword with no new mechanism, and their own self-evals explicitly said 'pair text fixes with something that changes what the operator can see or do' and 'diagnose against the producing job's actual last-run status, not just an archive-filename age heuristic.' This plan does exactly that: it adds a real cross-source freshness comparison (a new mechanism, not new prose) while bundling the leak fixes as a natural byproduct, which is the specific value-proposition change the repeated failures called for.
 - Self-eval: alignment=8, value=7, quality=8, risk=2
+
+## 2026-08-24 07:00
+- **[Tier 1]** Verified live: dashboard/briefings/current.md has not been regenerated since 2026-05-28 18:01 (confirmed via directory listing, today is 2026-08-24 = 88 days stale), and its content -- rendered as-is via st.markdown(briefing) on this page right now -- contains banned emoji (see markdown headers 'Immediate Actions Required', 'Monitor Closely', 'Fleet Health Overview', 'Trend Highlights', 'Recommended Maintenance Actions' all prefixed with emoji), untranslated Portuguese sentences, raw Dagster job names (save_sav_report, save_wnb_report, save_oxy_report, save_fuel_consumption_report), and a leaked internal infra URL ('http://localhost:3000'). The existing staleness logic (added in the 2026-08-23 run) only ever downgrades this to a st.warning reading '... the AI summary generation is delayed, but the core fleet data pipeline is current' -- true today since e2_foqa_report.parquet is fresh -- then still renders the broken content below it, so a delayed-sounding banner sits directly above a page that is actually dead and leaking infra details. Add a second, harder threshold that distinguishes 'delayed' from 'dead' and suppresses the markdown body entirely in the dead case, without using st.stop() so the Previous Briefings archive selector below still works.
+
+Exact edits to dashboard/pages/6_Fleet_Briefing.py:
+
+1) After line 15 (`_CORE_PIPELINE_STALE_HOURS = 48`), add:
+```python
+_BRIEFING_DEAD_HOURS = 168  # 7 days -- beyond this it is a stopped job, not a delay
+```
+
+2) Replace the existing block at lines 70-90 (`if age_hours <= 18: ... st.error(...)`) with:
+```python
+_briefing_is_dead = age_hours > _BRIEFING_DEAD_HOURS
+
+if _briefing_is_dead:
+    st.error(
+        f"{age_label} -- briefing generation has not produced a new summary in over "
+        f"{int(_BRIEFING_DEAD_HOURS // 24)} days, far beyond the twice-daily schedule. "
+        "The content below is no longer a reliable summary of fleet status and has "
+        "been hidden. Contact data operations to restore the briefing pipeline."
+    )
+elif age_hours <= 18:
+    st.success(age_label)
+else:
+    core_age_h = _core_pipeline_age_hours()
+    if core_age_h is None:
+        st.warning(
+            f"{age_label} -- the AI summary is behind schedule, and the core fleet data "
+            f"pipeline's freshness could not be checked. Treat all figures below with caution."
+        )
+    elif core_age_h <= _CORE_PIPELINE_STALE_HOURS:
+        st.warning(
+            f"{age_label} -- the AI summary generation is delayed, but the core fleet data "
+            f"pipeline is current (refreshed {core_age_h:.0f}h ago). Figures below may not "
+            f"reflect the most recent flights, but the underlying data pipeline is healthy."
+        )
+    else:
+        st.error(
+            f"{age_label} -- the AI summary is delayed AND the core fleet data pipeline is "
+            f"also stale (last refreshed {core_age_h:.0f}h ago, threshold {_CORE_PIPELINE_STALE_HOURS}h). "
+            f"This points to an underlying pipeline issue, not just a delayed summary -- contact data operations."
+        )
+```
+(Only the new `_briefing_is_dead` branch and its guard are new; the existing three inner branches are copied verbatim, unchanged, from the current file so the already-validated 2026-08-23 behavior for genuine short delays is fully preserved.)
+
+3) Replace lines 92-95 (`with open(CURRENT_PATH, ...) as f: briefing = f.read()` / `st.markdown(briefing)`) with:
+```python
+if not _briefing_is_dead:
+    with open(CURRENT_PATH, 'r', encoding='utf-8') as f:
+        briefing = f.read()
+    st.markdown(briefing)
+```
+
+No other lines touched -- the empty-state check at lines 32-34, `_latest_briefing_time()`, and the entire 'Previous Briefings' archive section (lines 97-111) are left exactly as-is, so a user can still deliberately open the stale May archive from the selector while the top of the page no longer passes it off as today's status.
+- Files: `dashboard/pages/6_Fleet_Briefing.py`
+- Rationale: This is a live, verified production defect, not a hypothesis: I confirmed via PowerShell directory listing that dashboard/briefings/current.md's mtime is 2026-05-28 (88 days old against today's 2026-08-24) and read its full content, which contains banned emoji, Portuguese sentences, raw Dagster job names, and a leaked 'http://localhost:3000' internal URL -- all of it rendered unconditionally today via st.markdown(briefing) on the customer-facing Fleet Briefing page. The existing staleness logic only ever labels this 'delayed' because the core FOQA pipeline happens to be fresh, which is a false reassurance sitting directly above genuinely broken content. This directly violates two independently-documented rules: CLAUDE.md's 'dado velho -> empty state honesto, nunca gráfico mudo ou dado inventado' and the memory's 'Veracidade de Fatos na UI' lesson that customer-visible product surfaces must never leak internal infra (job names, localhost URLs). Unlike the last five reverted runs (reworded prose, unverified row-count claims, truncated/buggy EDA panels, thin navigation links), this fix targets a concretely verified, currently-live defect with a real behavioral change (suppressing broken content past a hard staleness threshold) rather than another cosmetic pass, while reusing 100% of the already-validated 2026-08-23 warning/error branches unchanged.
+- Self-eval: alignment=8, value=7, quality=7, risk=2

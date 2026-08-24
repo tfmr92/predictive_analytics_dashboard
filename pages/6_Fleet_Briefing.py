@@ -13,6 +13,7 @@ st.set_page_config(page_title="Fleet Briefing", layout="wide")
 
 _CORE_PIPELINE_FILE = "e2_foqa_report.parquet"
 _CORE_PIPELINE_STALE_HOURS = 48
+_BRIEFING_DEAD_HOURS = 168  # 7 days -- beyond this it is a stopped job, not a delay
 
 
 @st.cache_data(ttl=300, show_spinner=False)
@@ -67,7 +68,16 @@ elif age_hours < 48:
 else:
     age_label = f"Generated {int(age_hours // 24)} days ago"
 
-if age_hours <= 18:
+_briefing_is_dead = age_hours > _BRIEFING_DEAD_HOURS
+
+if _briefing_is_dead:
+    st.error(
+        f"{age_label} -- briefing generation has not produced a new summary in over "
+        f"{int(_BRIEFING_DEAD_HOURS // 24)} days, far beyond the twice-daily schedule. "
+        "The content below is no longer a reliable summary of fleet status and has "
+        "been hidden. Contact data operations to restore the briefing pipeline."
+    )
+elif age_hours <= 18:
     st.success(age_label)
 else:
     core_age_h = _core_pipeline_age_hours()
@@ -89,10 +99,10 @@ else:
             f"This points to an underlying pipeline issue, not just a delayed summary -- contact data operations."
         )
 
-with open(CURRENT_PATH, 'r', encoding='utf-8') as f:
-    briefing = f.read()
-
-st.markdown(briefing)
+if not _briefing_is_dead:
+    with open(CURRENT_PATH, 'r', encoding='utf-8') as f:
+        briefing = f.read()
+    st.markdown(briefing)
 
 # Archive navigation
 st.divider()
