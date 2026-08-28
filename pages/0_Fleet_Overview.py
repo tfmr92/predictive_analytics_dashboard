@@ -518,7 +518,9 @@ airbus_catch = {key for key, n in airbus_alerts.items() if n > 5}
 # match airbus_catch ("A320:<tail>") so a tail flagged by both FOQA and SAV counts once.
 sav_a320_catch = {f"A320:{tail}" for tail in sav_a320_alerts}
 # Fuel cruise-burn own-baseline is excluded from the headline: it is a heuristic with no link to a confirmed failure (SAV/W&B/A320 SAV = model predictions, oxy amber = no-dispatch CAS, Airbus FOQA = certified-limit exceedances are the asserted catches).
-asserted_catches = len(sav_catch_msns | oxy_nodispatch_msns | wnb_catch_msns) + len(airbus_catch | sav_a320_catch)
+e2_catches = len(sav_catch_msns | oxy_nodispatch_msns | wnb_catch_msns)
+airbus_catches = len(airbus_catch | sav_a320_catch)
+asserted_catches = e2_catches + airbus_catches
 fuel_advisory_n = len(fuel_catch_msns)
 
 # ── KPI row ───────────────────────────────────────────────────────────────────
@@ -531,31 +533,62 @@ n_oxy_amber = sum(1 for v in oxy_alert.values() if v == 1)
 n_foqa      = sum(1 for v in foqa_exceedances.values() if v > 0)
 n_airbus    = sum(1 for v in airbus_alerts.values() if v > 0)
 
-c1, c2, c3, c4, c5, c6 = st.columns(6)
-c1.metric("E2 aircraft tracked", len(all_e2))
-c2.metric("SAV alerts (LH+RH)", n_sav_alert,
-          help="Aircraft with predicted pre-failure on starter valve (latest flight)")
-c3.metric("Oxy — no dispatch", n_oxy_red,
-          help=f"Latest PSI < {PSI_AMBER} — amber CAS, no departure")
-c4.metric("E2 FOQA exceedances", n_foqa,
-          help=f"Aircraft with ≥1 engine/aircraft exceedance in last {days_back} days")
-c5.metric("Airbus FOQA alerts", n_airbus,
-          help=f"A320/A330 aircraft with exceedances in last {days_back} days")
-c6.metric("Unsched. removals flagged", asserted_catches,
-          help="Distinct aircraft flagged with a critical predictive catch this period "
-               "(E2 SAV LH/RH pre-failure, oxygen no-dispatch, W&B brake/gear removal, "
-               "plus Airbus red-tier >5 exceedances and A320 starter-valve pre-failure). "
-               "Each is a potential unscheduled "
-               "removal / AOG caught before failure — a candidate save, not an asserted one.")
+_show_e2 = "E2" in fleet_filter
+_show_airbus = "A320" in fleet_filter or "A330" in fleet_filter
 
-st.caption(
-    "**Commercial impact** — each flagged aircraft is a potential unscheduled "
-    "removal or AOG caught predictively before in-service failure this period. "
-    "Specific tails are listed in the Immediate Actions banner below. "
-    f"Separately, {fuel_advisory_n} aircraft are on a fuel cruise-burn advisory "
-    "(>10% above their own baseline) — a monitor-tier heuristic confounded by "
-    "weight/altitude/wind, not an asserted predictive catch."
-)
+if not fleet_filter:
+    st.info("Select at least one fleet in the sidebar to see KPIs.")
+else:
+    scoped_catches = (e2_catches if _show_e2 else 0) + (airbus_catches if _show_airbus else 0)
+
+    kpi_items = []
+    if _show_e2:
+        kpi_items.append((
+            "E2 aircraft tracked", len(all_e2), None,
+        ))
+        kpi_items.append((
+            "SAV alerts (LH+RH)", n_sav_alert,
+            "Aircraft with predicted pre-failure on starter valve (latest flight)",
+        ))
+        kpi_items.append((
+            "Oxy — no dispatch", n_oxy_red,
+            f"Latest PSI < {PSI_AMBER} — amber CAS, no departure",
+        ))
+        kpi_items.append((
+            "E2 FOQA exceedances", n_foqa,
+            f"Aircraft with ≥1 engine/aircraft exceedance in last {days_back} days",
+        ))
+    if _show_airbus:
+        kpi_items.append((
+            "Airbus FOQA alerts", n_airbus,
+            f"A320/A330 aircraft with exceedances in last {days_back} days",
+        ))
+    kpi_items.append((
+        "Unsched. removals flagged", scoped_catches,
+        "Distinct aircraft flagged with a critical predictive catch this period, scoped to "
+        "the selected fleet(s) (E2 SAV LH/RH pre-failure, oxygen no-dispatch, W&B brake/gear "
+        "removal, plus Airbus red-tier >5 exceedances and A320 starter-valve pre-failure). "
+        "Each is a potential unscheduled removal / AOG caught before failure — a candidate "
+        "save, not an asserted one.",
+    ))
+
+    kpi_cols = st.columns(len(kpi_items))
+    for col, (label, value, help_text) in zip(kpi_cols, kpi_items):
+        col.metric(label, value, help=help_text)
+
+    if set(fleet_filter) != {"E2", "A320", "A330"}:
+        _fleet_names = {"E2": "E195-E2", "A320": "A320", "A330": "A330"}
+        _scope = ", ".join(_fleet_names[f] for f in ["E2", "A320", "A330"] if f in fleet_filter)
+        st.caption(f"Showing: {_scope} only — KPIs above are scoped to this fleet selection.")
+
+    st.caption(
+        "**Commercial impact** — each flagged aircraft is a potential unscheduled "
+        "removal or AOG caught predictively before in-service failure this period. "
+        "Specific tails are listed in the Immediate Actions banner below. "
+        f"Separately, {fuel_advisory_n} aircraft are on a fuel cruise-burn advisory "
+        "(>10% above their own baseline) — a monitor-tier heuristic confounded by "
+        "weight/altitude/wind, not an asserted predictive catch."
+    )
 
 # ── Predictive track record (ACARS-validated ground truth, E2 SAV only) ────────
 # Grounds the 'unscheduled removals avoided' claim in confirmed failures: among past
