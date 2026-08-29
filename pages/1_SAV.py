@@ -47,6 +47,105 @@ st.markdown(
     "GroupKFold **AUC 0.74**, validated against ACARS-confirmed removals."
 )
 
+# ── Fleet selector ────────────────────────────────────────────────────────────
+sav_fleet_pick = st.radio(
+    "Fleet",
+    options=["E195-E2", "Airbus A320/A321"],
+    index=0,
+    horizontal=True,
+    key="sav_fleet_pick",
+)
+
+if sav_fleet_pick == "Airbus A320/A321":
+    render_freshest_badge(
+        ["airbus_sav_eng1_report.parquet", "airbus_sav_eng2_report.parquet"],
+        label="A320 SAV report",
+    )
+
+    _A320_PRED_COL = "sav_failure_pred"
+    _A320_PROB_COL = "sav_failure_prob"
+    _A320_AC_COL = "aircraft_id"
+
+    @st.cache_data(ttl=300)
+    def _load_a320_sav(filename: str) -> pd.DataFrame:
+        df = load(filename)
+        if df.empty:
+            return df
+        if "flight_datetime" in df.columns:
+            df["date"] = pd.to_datetime(df["flight_datetime"], errors="coerce")
+        if _A320_AC_COL in df.columns:
+            df[_A320_AC_COL] = df[_A320_AC_COL].astype(str).str.strip()
+            df = df[df[_A320_AC_COL] != ""]
+        return df.dropna(subset=["date"]).sort_values("date")
+
+    _df_a320_e1 = _load_a320_sav("airbus_sav_eng1_report.parquet")
+    _df_a320_e2 = _load_a320_sav("airbus_sav_eng2_report.parquet")
+
+    if _df_a320_e1.empty and _df_a320_e2.empty:
+        render_empty_state(
+            ["airbus_sav_eng1_report.parquet", "airbus_sav_eng2_report.parquet"],
+            "SAV A320",
+        )
+        st.stop()
+
+    def _latest_a320(df: pd.DataFrame, engine_label: str) -> pd.DataFrame:
+        if df.empty or _A320_PROB_COL not in df.columns:
+            return pd.DataFrame()
+        latest = (
+            df.sort_values("date").groupby(_A320_AC_COL).last()
+            [[_A320_PROB_COL, _A320_PRED_COL]].reset_index()
+        )
+        latest["Engine"] = engine_label
+        return latest
+
+    _latest_a320_combined = pd.concat(
+        [_latest_a320(_df_a320_e1, "Eng 1"), _latest_a320(_df_a320_e2, "Eng 2")],
+        ignore_index=True,
+    )
+
+    _a320_aircraft_tracked = len(
+        set(_df_a320_e1[_A320_AC_COL].unique() if not _df_a320_e1.empty else [])
+        | set(_df_a320_e2[_A320_AC_COL].unique() if not _df_a320_e2.empty else [])
+    )
+    _a320_high_risk_engines = (
+        int(_latest_a320_combined[_A320_PRED_COL].eq(1).sum())
+        if not _latest_a320_combined.empty else 0
+    )
+
+    c1, c2 = st.columns(2)
+    c1.metric("A320/A321 aircraft tracked", _a320_aircraft_tracked)
+    c2.metric("Engines in High risk", _a320_high_risk_engines)
+
+    if not _latest_a320_combined.empty:
+        _latest_a320_combined["ac_engine"] = (
+            _latest_a320_combined[_A320_AC_COL] + " — " + _latest_a320_combined["Engine"]
+        )
+        _top10_a320 = _latest_a320_combined.sort_values(
+            _A320_PROB_COL, ascending=False
+        ).head(10)
+        _top10_a320["color"] = _top10_a320[_A320_PRED_COL].map({0: "#22c55e", 1: "#ef4444"})
+        _fig_a320_risk = go.Figure(go.Bar(
+            y=_top10_a320["ac_engine"], x=_top10_a320[_A320_PROB_COL],
+            orientation="h", marker_color=_top10_a320["color"],
+            text=_top10_a320[_A320_PROB_COL].map(lambda p: f"{p:.0%}"),
+            textposition="outside",
+        ))
+        _fig_a320_risk.update_layout(
+            title="Top 10 aircraft x engine by SAV pre-failure risk",
+            xaxis=dict(range=[0, 1.15], tickformat=".0%"),
+            yaxis_title="Aircraft x Engine", height=max(300, len(_top10_a320) * 28),
+            margin=dict(l=10, r=10, t=40, b=10),
+        )
+        st.plotly_chart(_fig_a320_risk, use_container_width=True)
+    else:
+        st.info("No A320/A321 SAV predictions available yet.")
+
+    st.page_link(
+        "pages/7_SAV_A320.py",
+        label="Open full A320 SAV page (EDA, filters, threshold analysis)",
+    )
+    st.stop()
+
 # ── Operating point ───────────────────────────────────────────────────────────
 # Documented calibrated-probability bands, used as a fallback when the producing
 # job has not (yet) stamped a model-derived F2 threshold into the parquet.
