@@ -130,10 +130,22 @@ _e1_alerts = _alert_tails(df_e1_full)
 _e2_alerts = _alert_tails(df_e2_full)
 
 c1, c2, c3, c4 = st.columns(4)
-c1.metric("Aircraft monitored (Eng 1)", df_e1[AC_COL].nunique() if not df_e1.empty else 0)
-c2.metric("In alert — Eng 1", len(_e1_alerts))
-c3.metric("Aircraft monitored (Eng 2)", df_e2[AC_COL].nunique() if not df_e2.empty else 0)
-c4.metric("In alert — Eng 2", len(_e2_alerts))
+c1.metric(
+    "Aircraft monitored (Eng 1)", df_e1[AC_COL].nunique() if not df_e1.empty else 0,
+    help=f"Aircraft with a QAR engine-start record for Engine 1 in the last {days_back} days",
+)
+c2.metric(
+    "In alert — Eng 1", len(_e1_alerts),
+    help="Aircraft whose latest Engine 1 start is predicted pre-failure (sav_failure_pred==1)",
+)
+c3.metric(
+    "Aircraft monitored (Eng 2)", df_e2[AC_COL].nunique() if not df_e2.empty else 0,
+    help=f"Aircraft with a QAR engine-start record for Engine 2 in the last {days_back} days",
+)
+c4.metric(
+    "In alert — Eng 2", len(_e2_alerts),
+    help="Aircraft whose latest Engine 2 start is predicted pre-failure (sav_failure_pred==1)",
+)
 
 _aged_e1 = _alert_tails_aged(df_e1_full)
 _aged_e2 = _alert_tails_aged(df_e2_full)
@@ -489,7 +501,7 @@ with tab_status:
                 st.info("No data.")
                 continue
             latest = (
-                df.sort_values("date").groupby(AC_COL).last()[[PROB_COL, PRED_COL]]
+                df.sort_values("date").groupby(AC_COL).last()[[PROB_COL, PRED_COL, "date"]]
                 .reset_index().sort_values(PROB_COL, ascending=False)
             )
             n_total = len(latest)
@@ -499,11 +511,21 @@ with tab_status:
                 st.caption(f"Top {len(latest)} of {n_total} aircraft by latest risk "
                            f"(all {n_alert} in alert shown).")
             latest["color"] = latest[PRED_COL].map({0: "#22c55e", 1: "#ef4444"})
+            latest["status_label"] = latest[PRED_COL].map({0: "Normal", 1: "Alert"})
+            latest["date_label"] = latest["date"].dt.strftime("%d-%b-%Y")
             fig_risk = go.Figure(go.Bar(
                 y=latest[AC_COL], x=latest[PROB_COL],
                 orientation="h", marker_color=latest["color"],
                 text=latest[PROB_COL].map(lambda p: f"{p:.0%}"),
                 textposition="outside",
+                customdata=latest[["status_label", "date_label"]].values,
+                hovertemplate=(
+                    "<b>%{y}</b><br>"
+                    "Predicted probability: %{x:.0%}<br>"
+                    "Last engine start: %{customdata[1]}<br>"
+                    "Status: %{customdata[0]}"
+                    "<extra></extra>"
+                ),
             ))
             fig_risk.update_layout(
                 title=title, xaxis=dict(range=[0, 1.15], tickformat=".0%"),
