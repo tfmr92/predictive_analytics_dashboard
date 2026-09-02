@@ -1110,6 +1110,34 @@ for label, df_key, filename, producing_job, affected_pages in PIPELINE_SOURCES:
         "Affected pages": affected_pages,
     })
 
+# --- Fleet KPIs ---
+st.subheader(":material/speed: Fleet KPIs")
+_fleet_kpi_cols = st.columns(4)
+for _fk_col, _fk_label, _fk_raw, _fk_help in [
+    (_fleet_kpi_cols[0], "Asserted catches", asserted_catches,
+     "Predictive catches confirmed this period across the fleet."),
+    (_fleet_kpi_cols[1], "Fuel advisories", fuel_advisory_n,
+     "Aircraft on a fuel cruise-burn advisory (monitor-tier heuristic, not an asserted catch)."),
+    (_fleet_kpi_cols[2], "SAV alerts", n_sav_alert,
+     "E2 aircraft with predicted starter-valve pre-failure on the latest flight."),
+]:
+    _fk_value = _fk_raw if _fk_raw is not None and not (isinstance(_fk_raw, float) and pd.isna(_fk_raw)) else None
+    if _fk_value is None:
+        _fk_col.metric(_fk_label, "N/A", help=_fk_help)
+        _fk_col.caption("Source is stale or unavailable for this period.")
+    else:
+        _fk_col.metric(_fk_label, _fk_value, help=_fk_help)
+
+_fk_stale = n_stale if n_stale is not None and not (isinstance(n_stale, float) and pd.isna(n_stale)) else None
+_fk_total = n_total if n_total is not None and not (isinstance(n_total, float) and pd.isna(n_total)) else None
+if _fk_stale is None or _fk_total is None:
+    _fleet_kpi_cols[3].metric("Stale data sources", "N/A",
+                               help="Pipeline sources not refreshed within 48h.")
+    _fleet_kpi_cols[3].caption("Pipeline freshness data is stale or unavailable.")
+else:
+    _fleet_kpi_cols[3].metric("Stale data sources", f"{_fk_stale} / {_fk_total}",
+                               help="Pipeline sources not refreshed within 48h, out of all tracked sources.")
+
 if n_stale > 0:
     st.warning(
         "; ".join(_stale_notices) + ". Contact data operations to refresh the pipeline."
